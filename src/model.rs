@@ -1,8 +1,5 @@
 //! Normalized representation of on-screen interactable elements.
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 /// Stable, opaque identifier for an [`Element`] within a single enumeration
 /// pass. Backends are free to choose any encoding; consumers must not assume
 /// any structure.
@@ -10,13 +7,11 @@ use serde::{Deserialize, Serialize};
 /// IDs are not guaranteed to remain valid across enumerations — call
 /// [`crate::Backend::enumerate_foreground`] again to refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ElementId(pub u64);
 
 /// Pixel-space rectangle in physical (DPI-aware) coordinates relative to the
 /// virtual desktop origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Bounds {
     /// Left edge, in physical pixels.
     pub x: i32,
@@ -43,7 +38,6 @@ impl Bounds {
 /// High-level semantic role of an element. Mirrors the most useful subset of
 /// the UI Automation / AT-SPI / ARIA role taxonomies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub enum Role {
     /// A clickable button.
@@ -72,7 +66,6 @@ pub enum Role {
 
 /// A single interactable thing discovered on screen.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Element {
     /// Backend-assigned identifier.
     pub id: ElementId,

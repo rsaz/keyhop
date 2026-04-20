@@ -10,6 +10,7 @@
 
 pub mod hotkey;
 pub mod overlay;
+pub mod single_instance;
 pub mod tray;
 pub mod window_picker;
 

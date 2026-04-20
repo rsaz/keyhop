@@ -1,13 +1,9 @@
 //! Actions that can be performed against an [`crate::Element`].
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 /// Things keyhop can do to a target element. Backends choose the best native
 /// mechanism (UI Automation invoke pattern, synthesized input, etc.) and may
 /// return an error for actions a given element does not support.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub enum Action {
     /// Trigger the element's primary action (button press, link follow, ...).

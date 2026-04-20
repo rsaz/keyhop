@@ -17,7 +17,6 @@ categories = ["accessibility", "gui", "os"]
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1", features = ["derive"], optional = true }
 
 # Windows-only deps. Non-Windows targets compile the lib without these (and
 # without the `crate::windows` module), which keeps `cargo check` honest on
@@ -25,23 +24,30 @@ serde = { version = "1", features = ["derive"], optional = true }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
 ] }
 uiautomation = "0.24"
 global-hotkey = "0.7"
-tray-icon = "0.22.0"
-
-[features]
-default = []
-serde = ["dep:serde"]
+# default-features off skips the X11 (`libxdo`) backend muda would pull in
+# otherwise — pure dead weight on Windows.
+tray-icon = { version = "0.22", default-features = false }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 opt-level = 3
+
+# docs.rs builds on Linux by default. Without this our entire `windows`
+# module would be cfg-gated out and the rendered docs would look empty.
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+rustdoc-args = ["--cfg", "docsrs"]

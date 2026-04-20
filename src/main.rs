@@ -12,51 +12,146 @@
 //! overlay; the tray's `Quit` entry — or `Ctrl+C` in this terminal — exits
 //! the message loop.
 
+use std::process::ExitCode;
+
 use keyhop::{Action, Backend, Element, HintEngine};
 
 #[cfg(windows)]
 use keyhop::windows::{
     hotkey::{HotkeyAction, Hotkeys},
     overlay::{pick_hint, Hint, HintStyle},
+    single_instance::InstanceGuard,
     tray::{Tray, TrayCommand},
     window_picker,
 };
 
-fn main() -> anyhow::Result<()> {
-    init_tracing();
+/// Parsed command-line flags. Hand-rolled so we don't pull in `clap` for
+/// three options.
+#[derive(Debug, Default, Clone, Copy)]
+struct Cli {
+    no_tray: bool,
+}
 
+fn main() -> ExitCode {
+    let cli = match parse_args() {
+        Ok(Some(cli)) => cli,
+        Ok(None) => return ExitCode::SUCCESS, // --help / --version handled
+        Err(code) => return code,
+    };
+
+    init_tracing();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "keyhop starting");
 
+    let result: anyhow::Result<()>;
     #[cfg(windows)]
     {
-        run_windows()
+        result = run_windows(cli);
     }
-
     #[cfg(not(windows))]
     {
-        anyhow::bail!("no backend available for this platform yet")
+        let _ = cli;
+        result = Err(anyhow::anyhow!(
+            "no backend available for this platform yet"
+        ));
+    }
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = ?e, "keyhop exited with error");
+            ExitCode::from(1)
+        }
     }
 }
 
+fn parse_args() -> Result<Option<Cli>, ExitCode> {
+    let mut cli = Cli::default();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("keyhop {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--no-tray" => cli.no_tray = true,
+            other => {
+                eprintln!("keyhop: unknown argument: {other}");
+                eprintln!("Try 'keyhop --help' for a list of options.");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok(Some(cli))
+}
+
+fn print_help() {
+    println!(
+        "keyhop {} — system-wide keyboard navigation overlay",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    println!("USAGE:");
+    println!("    keyhop [FLAGS]");
+    println!();
+    println!("FLAGS:");
+    println!("    -h, --help        Print help and exit");
+    println!("    -V, --version     Print version and exit");
+    println!("        --no-tray     Run without the system tray icon (hotkeys-only mode)");
+    println!();
+    println!("DEFAULT HOTKEYS:");
+    println!("    Ctrl+Shift+Space  Pick element in foreground window");
+    println!("    Ctrl+Alt+Space    Pick top-level window across all monitors");
+    println!("    Esc               Cancel an open overlay");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("    RUST_LOG          Tracing filter, e.g. `keyhop=debug` (default: info)");
+    println!();
+    println!("PROJECT:");
+    println!("    Repository:       {}", env!("CARGO_PKG_REPOSITORY"));
+}
+
 #[cfg(windows)]
-fn run_windows() -> anyhow::Result<()> {
+fn run_windows(cli: Cli) -> anyhow::Result<()> {
     use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
     };
 
-    let mut backend = keyhop::windows::WindowsBackend::new()?;
-    let hotkeys = Hotkeys::register_defaults()?;
-    // The tray is best-effort: if it can't be created (e.g. headless CI,
-    // no shell), we still want the hotkeys to work.
-    let tray = match Tray::build() {
-        Ok(t) => Some(t),
-        Err(e) => {
-            tracing::warn!(error = ?e, "tray icon unavailable; continuing with hotkeys only");
-            None
+    // Refuse to start a second copy in the same session — two instances
+    // would race for the same global hotkeys and double-stack tray icons.
+    let _instance = match InstanceGuard::acquire()? {
+        Some(guard) => guard,
+        None => {
+            eprintln!("keyhop is already running in this session.");
+            eprintln!("Use the existing tray icon, or quit it first.");
+            // Exit successfully so launchers / autostart shims don't show
+            // an error dialog when the user double-clicks twice.
+            return Ok(());
         }
     };
 
-    println!("keyhop is running.");
+    let mut backend = keyhop::windows::WindowsBackend::new()?;
+    let hotkeys = Hotkeys::register_defaults()?;
+
+    // The tray is opt-in via `--no-tray` and best-effort otherwise: if it
+    // can't be created (e.g. headless CI, no Explorer shell) we still want
+    // the hotkeys to work.
+    let tray = if cli.no_tray {
+        tracing::info!("--no-tray: running without system tray icon");
+        None
+    } else {
+        match Tray::build() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(error = ?e, "tray icon unavailable; continuing with hotkeys only");
+                None
+            }
+        }
+    };
+
+    println!("keyhop {} is running.", env!("CARGO_PKG_VERSION"));
     println!("  Pick element : Ctrl + Shift + Space");
     println!("  Pick window  : Ctrl + Alt   + Space");
     println!("  Cancel       : Esc (inside overlay)");
