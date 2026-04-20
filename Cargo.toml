@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/keyhop-core",
+    "crates/keyhop-windows",
+    "crates/keyhop-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+authors = ["Richard Zampieri <br.developer@gmail.com>"]
+repository = "https://github.com/rsaz/keyhop"
+homepage = "https://github.com/rsaz/keyhop"
+documentation = "https://docs.rs/keyhop-core"
+readme = "README.md"
+keywords = ["keyboard", "accessibility", "vimium", "automation", "hotkey"]
+categories = ["accessibility", "gui", "os"]
+
+[workspace.dependencies]
+keyhop-core = { path = "crates/keyhop-core", version = "0.1.0" }
+keyhop-windows = { path = "crates/keyhop-windows", version = "0.1.0" }
+
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+
+# Windows-only deps live here too so versions are pinned in one place.
+windows = "0.58"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

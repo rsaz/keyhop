@@ -1,0 +1,24 @@
+[package]
+name = "keyhop-windows"
+description = "Windows backend for keyhop: UI Automation enumeration, global hotkeys, and overlay rendering."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dependencies]
+keyhop-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

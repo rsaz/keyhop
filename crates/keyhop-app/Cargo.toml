@@ -1,0 +1,27 @@
+[package]
+name = "keyhop-app"
+description = "Keyhop binary: system-wide keyboard navigation overlay."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[[bin]]
+name = "keyhop"
+path = "src/main.rs"
+
+[dependencies]
+keyhop-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyhop-windows.workspace = true
