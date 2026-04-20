@@ -9,6 +9,11 @@
 
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
+#[cfg(windows)]
+pub mod hotkey;
+#[cfg(windows)]
+pub mod overlay;
+
 use std::collections::HashMap;
 
 use anyhow::Context;
@@ -20,6 +25,10 @@ use uiautomation::{
     UIAutomation, UIElement, UITreeWalker,
 };
 
+#[cfg(windows)]
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -46,8 +55,14 @@ impl WindowsBackend {
     pub fn new() -> anyhow::Result<Self> {
         #[cfg(windows)]
         {
-            let automation =
-                UIAutomation::new().context("initializing UI Automation client")?;
+            // PerMonitorV2 ensures `GetBoundingRectangle` returns physical
+            // pixels matching the overlay's coordinate space on high-DPI
+            // displays. Best-effort: ignore "already set" / older-OS errors.
+            unsafe {
+                let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            }
+
+            let automation = UIAutomation::new().context("initializing UI Automation client")?;
             Ok(Self {
                 automation,
                 elements: HashMap::new(),

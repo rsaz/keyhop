@@ -37,13 +37,30 @@ cargo run -p keyhop
 cargo run -p keyhop-windows --example enumerate_foreground
 ```
 
+## Using it
+
+Run `cargo run -p keyhop` (or `cargo run --release -p keyhop` for the snappy experience). The app sits in the terminal and registers a global hotkey:
+
+| Action  | Keys                  |
+| ------- | --------------------- |
+| Leader  | `Ctrl + Shift + Space` |
+| Confirm | type the hint label    |
+| Backspace | `Backspace`          |
+| Cancel  | `Esc` (inside overlay) |
+| Quit    | `Ctrl+C` in the terminal |
+
+Switch focus to any app, hit the leader, then type the yellow label that appears on the control you want — `keyhop` invokes it via UI Automation.
+
 ## Roadmap
 
 - [x] Workspace scaffold
-- [ ] Foreground window UI Automation tree walk
-- [ ] Hint overlay (transparent click-through window)
-- [ ] Global leader hotkey + modal input
-- [ ] Action dispatch (Invoke, Focus, Type, Scroll)
+- [x] Foreground window UI Automation tree walk
+- [x] Global leader hotkey + modal input
+- [x] Hint overlay (transparent layered window)
+- [x] Invoke action dispatch
+- [ ] Click-through overlay so non-target apps still see the mouse
+- [ ] Multi-monitor / per-monitor DPI tuning
+- [ ] More actions (Focus, Type, Scroll)
 - [ ] Configuration file (TOML)
 - [ ] Linux backend (X11 first)
 - [ ] Wayland backend
