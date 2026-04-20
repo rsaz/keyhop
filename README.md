@@ -1,8 +1,8 @@
 # keyhop
 
-> Vimium for your entire desktop. Press a leader key, see hint labels on every clickable thing on screen, type the hint, done.
+> Drive your entire desktop from the keyboard. Press a leader key, see hint labels on every clickable thing on screen, type the hint, done.
 
-`keyhop` is a system-wide keyboard navigation layer that lets you drive your whole computer without a mouse. Inspired by [Vimium](https://vimium.github.io/) for the browser, but extended to native applications via OS accessibility APIs.
+`keyhop` is a system-wide keyboard navigation layer that lets you control your whole computer without ever touching the mouse. Reaching for the mouse forces a constant context switch between thinking and pointing — your hands leave the home row, your eyes hunt for a cursor, and your flow breaks. `keyhop` keeps you on the keyboard so you stay fast, focused, and productive, using OS accessibility APIs to target native UI elements semantically.
 
 **Status:** Pre-alpha. Windows backend in early development. Linux planned.
 
@@ -20,7 +20,7 @@ keyhop/
 ├─ crates/
 │  ├─ keyhop-core/      # platform-agnostic types, traits, hint engine
 │  ├─ keyhop-windows/   # Windows backend (UI Automation, hooks, overlay)
-│  └─ keyhop-app/       # the binary that wires everything together
+│  └─ keyhop/           # the binary that wires everything together
 ```
 
 `keyhop-core` and `keyhop-windows` are designed to be published independently to crates.io.
@@ -33,7 +33,7 @@ Requires:
 
 ```powershell
 cargo build --workspace
-cargo run -p keyhop-app
+cargo run -p keyhop
 cargo run -p keyhop-windows --example enumerate_foreground
 ```
 

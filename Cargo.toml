@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/keyhop-core",
     "crates/keyhop-windows",
-    "crates/keyhop-app",
+    "crates/keyhop",
 ]
 
 [workspace.package]
@@ -16,7 +16,7 @@ repository = "https://github.com/rsaz/keyhop"
 homepage = "https://github.com/rsaz/keyhop"
 documentation = "https://docs.rs/keyhop-core"
 readme = "README.md"
-keywords = ["keyboard", "accessibility", "vimium", "automation", "hotkey"]
+keywords = ["keyboard", "accessibility", "productivity", "automation", "hotkey"]
 categories = ["accessibility", "gui", "os"]
 
 [workspace.dependencies]

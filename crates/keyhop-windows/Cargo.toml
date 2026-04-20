@@ -17,6 +17,7 @@ windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
 ] }
+uiautomation = "0.24"
 
 [dependencies]
 keyhop-core.workspace = true

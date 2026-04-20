@@ -1,9 +1,13 @@
 //! `keyhop` — system-wide keyboard navigation overlay.
 //!
-//! This binary is intentionally minimal at this stage. It wires up logging,
-//! constructs a platform backend, and runs a one-shot enumeration. The full
-//! interactive overlay loop (leader hotkey, hint rendering, action dispatch)
-//! is the next milestone.
+//! Current behavior: wait briefly so the user can switch to whichever window
+//! they want to inspect, enumerate the interactable elements via the
+//! configured backend, and print each one with its assigned hint label.
+//!
+//! The interactive overlay loop (global hotkey, transparent overlay window,
+//! action dispatch) is the next milestone.
+
+use std::{thread, time::Duration};
 
 use keyhop_core::{Backend, HintEngine};
 
@@ -13,23 +17,29 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "keyhop starting");
 
     let mut backend = build_backend()?;
+
+    println!("keyhop · enumeration preview");
+    println!("Switch to the window you want to navigate.");
+    for s in (1..=3).rev() {
+        println!("  enumerating in {s}...");
+        thread::sleep(Duration::from_secs(1));
+    }
+
     let elements = backend.enumerate_foreground()?;
-
     let hints = HintEngine::default().generate(elements.len());
-    tracing::info!(
-        element_count = elements.len(),
-        hint_count = hints.len(),
-        "enumerated foreground"
-    );
 
+    println!();
     if elements.is_empty() {
-        println!("No interactable elements discovered yet.");
-        println!("Backend enumeration is still a stub — this is expected.");
+        println!("No interactable elements discovered.");
+        println!("Try focusing an app like Notepad, File Explorer, or a browser.");
     } else {
+        println!("Found {} interactable elements:", elements.len());
         for (el, hint) in elements.iter().zip(hints.iter()) {
             println!(
-                "[{hint:>3}] {role:?}  {name}",
+                "  [{hint:>3}] {role:<10?} {w:>4}x{h:<4}  {name}",
                 role = el.role,
+                w = el.bounds.width,
+                h = el.bounds.height,
                 name = el.name.as_deref().unwrap_or("<unnamed>")
             );
         }
