@@ -119,25 +119,32 @@ fn enumerate() -> anyhow::Result<()> {
 
 ## Roadmap
 
-- [x] Single-crate scaffold
+### Shipped (v0.1.0)
+
+- [x] Single-crate scaffold publishable to crates.io
 - [x] Foreground window UI Automation tree walk
 - [x] Global leader hotkeys + modal input
-- [x] Hint overlay (transparent layered window)
+- [x] Hint overlay (transparent layered window) with collision resolution
 - [x] Invoke action dispatch
 - [x] Window picker mode (Alt-Tab with hints, all monitors)
-- [x] Multi-monitor coordinate fix
-- [x] Hint collision resolution
-- [x] System tray icon + menu
+- [x] Multi-monitor coordinate handling
+- [x] System tray icon + context menu
 - [x] CLI flags (`--version`, `--help`, `--no-tray`)
 - [x] Single-instance guard
+
+### Next up (v0.2.0)
+
 - [ ] GUI-subsystem release build (hide the console window) with parent-console attach for `--help`/`--version`
-- [ ] Configurable hotkeys / colors / alphabet (TOML config)
-- [ ] More UIA actions (`Focus`, `Type`, `Scroll`)
+- [ ] Configurable hotkeys, colors, and hint alphabet via a TOML config file
+- [ ] More UIA actions wired through (`Focus`, `Type`, `Scroll`)
+- [ ] Polished tray icon (multi-resolution `.ico` instead of the procedural badge)
+
+### Future
+
 - [ ] Click-through overlay so non-target apps still see the mouse
-- [ ] MSI installer + Winget manifest
-- [ ] Linux backend (X11 first)
-- [ ] Wayland backend
-- [ ] macOS backend (Accessibility API)
+- [ ] MSI installer and a Winget manifest
+- [ ] Linux backend (X11 first, then Wayland) via AT-SPI
+- [ ] macOS backend via the Accessibility API
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
