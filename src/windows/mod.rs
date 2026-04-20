@@ -19,6 +19,10 @@ use std::collections::HashMap;
 use anyhow::Context;
 
 use uiautomation::{
+    patterns::{
+        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern,
+        UISelectionItemPattern, UITogglePattern,
+    },
     types::{ControlType, Handle},
     UIAutomation, UIElement, UITreeWalker,
 };
@@ -100,12 +104,23 @@ impl Backend for WindowsBackend {
             .with_context(|| format!("unknown element id {id:?}"))?;
 
         match action {
-            // For now Invoke and Click both go through the synthesized mouse
-            // click path. A future revision should prefer the UIA Invoke
-            // pattern when available so we don't depend on accurate screen
-            // coordinates (matters for virtualized lists, off-screen
-            // scrolling, etc.).
-            Action::Invoke | Action::Click => {
+            // Invoke goes through the UIA pattern cascade — no cursor warp,
+            // works on virtualized / off-screen items, respects the app's
+            // accessibility hooks. Mouse-click is the explicit last resort
+            // for legacy controls that don't expose any pattern.
+            Action::Invoke => {
+                let path = invoke_smart(el).context("invoking element failed")?;
+                if path == InvokePath::MouseFallback {
+                    tracing::warn!(?id, "no UIA pattern matched; used mouse-click fallback");
+                } else {
+                    tracing::debug!(?id, ?path, "element invoked via UIA pattern");
+                }
+            }
+            // Click is the explicit "synthesize a real mouse click" action.
+            // Different semantics from Invoke — caller is opting in to
+            // cursor motion, useful for testing or for apps that only
+            // respond to genuine input.
+            Action::Click => {
                 el.click().context("element.click() failed")?;
             }
             Action::Focus => {
@@ -118,6 +133,68 @@ impl Backend for WindowsBackend {
         }
         Ok(())
     }
+}
+
+/// Which path through [`invoke_smart`] succeeded. Surfaced via tracing so we
+/// can spot apps that consistently fall through to the mouse fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokePath {
+    Invoke,
+    Toggle,
+    SelectionItem,
+    ExpandCollapse,
+    LegacyDefaultAction,
+    MouseFallback,
+}
+
+/// Try every UIA pattern that could plausibly "invoke" `el`, in order of
+/// specificity, and return which one worked. Falls back to a synthesized
+/// mouse click only when every pattern path has been exhausted.
+///
+/// Pattern cascade rationale:
+///
+/// 1. [`UIInvokePattern`] — the canonical "do the primary action" interface.
+///    Buttons, links, menu items, split buttons all expose it.
+/// 2. [`UITogglePattern`] — checkboxes, toggle buttons.
+/// 3. [`UISelectionItemPattern`] — tabs, radios, list/tree items.
+/// 4. [`UIExpandCollapsePattern`] — combo boxes, tree expanders.
+/// 5. [`UILegacyIAccessiblePattern::do_default_action`] — broad
+///    MSAA-compatible fallback that often works when the modern patterns
+///    aren't exposed.
+/// 6. [`UIElement::click`] — synthesized mouse click. Last resort: warps
+///    the cursor and is the only thing that works for some pre-UIA Win32
+///    controls. We prefer never to hit this path.
+fn invoke_smart(el: &UIElement) -> anyhow::Result<InvokePath> {
+    if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
+        if p.invoke().is_ok() {
+            return Ok(InvokePath::Invoke);
+        }
+    }
+    if let Ok(p) = el.get_pattern::<UITogglePattern>() {
+        if p.toggle().is_ok() {
+            return Ok(InvokePath::Toggle);
+        }
+    }
+    if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
+        if p.select().is_ok() {
+            return Ok(InvokePath::SelectionItem);
+        }
+    }
+    if let Ok(p) = el.get_pattern::<UIExpandCollapsePattern>() {
+        // Expand-only: for an already-expanded element this is a no-op on
+        // most controls. Collapsing on Invoke would surprise the user (you
+        // pressed a hint to *do* the thing, not to undo it).
+        if p.expand().is_ok() {
+            return Ok(InvokePath::ExpandCollapse);
+        }
+    }
+    if let Ok(p) = el.get_pattern::<UILegacyIAccessiblePattern>() {
+        if p.do_default_action().is_ok() {
+            return Ok(InvokePath::LegacyDefaultAction);
+        }
+    }
+    el.click().context("element.click() failed")?;
+    Ok(InvokePath::MouseFallback)
 }
 
 impl WindowsBackend {
