@@ -13,7 +13,6 @@
 use std::ffi::c_void;
 
 use anyhow::{anyhow, Context, Result};
-use keyhop_core::{Element, ElementId};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -39,6 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
+use crate::{Element, ElementId};
+
 const CLASS_NAME: PCWSTR = w!("KeyhopOverlayClass");
 const WINDOW_TITLE: PCWSTR = w!("Keyhop Overlay");
 
@@ -57,7 +58,7 @@ const LABEL_PADDING_Y: i32 = 2;
 /// Inputs to [`show_overlay`].
 pub struct OverlayConfig {
     /// Pairs of `(element, hint label)`. Labels should already be lowercase
-    /// home-row strings produced by [`keyhop_core::HintEngine`].
+    /// home-row strings produced by [`crate::HintEngine`].
     pub hints: Vec<(Element, String)>,
 }
 

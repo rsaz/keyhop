@@ -5,9 +5,9 @@ use crate::model::{Element, ElementId};
 
 /// A platform-specific provider of interactable elements and action dispatch.
 ///
-/// Implementations live in sibling crates such as `keyhop-windows` and (later)
-/// `keyhop-linux`. The trait intentionally stays small so it can be kept
-/// stable as the higher-level engine evolves.
+/// Implementations live in sibling modules such as [`crate::windows`]. The
+/// trait intentionally stays small so it can be kept stable as the
+/// higher-level engine evolves.
 pub trait Backend {
     /// Enumerate interactable elements visible in the currently focused
     /// window or top-level surface.

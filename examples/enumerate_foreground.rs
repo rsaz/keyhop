@@ -2,7 +2,7 @@
 //! visible element with its control type, size, and accessible name.
 //!
 //! ```powershell
-//! cargo run -p keyhop-windows --example enumerate_foreground
+//! cargo run --example enumerate_foreground
 //! ```
 //!
 //! The program counts down for 3 seconds before snapshotting, so you can

@@ -4,7 +4,7 @@
 //! The underlying [`GlobalHotKeyManager`] uses a hidden Win32 message-only
 //! window to receive `WM_HOTKEY`. The owning thread must therefore run a
 //! Win32 message loop (`GetMessageW` / `DispatchMessageW`) for events to be
-//! delivered. The `keyhop-app` binary takes care of that.
+//! delivered. The `keyhop` binary takes care of that.
 
 use anyhow::{Context, Result};
 use global_hotkey::{

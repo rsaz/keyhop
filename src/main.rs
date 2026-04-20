@@ -5,10 +5,10 @@
 //! shows a transparent overlay listing them. Typing a label invokes the
 //! corresponding control; `Esc` cancels.
 
-use keyhop_core::{Action, Backend, HintEngine};
+use keyhop::{Action, Backend, HintEngine};
 
 #[cfg(windows)]
-use keyhop_windows::{
+use keyhop::windows::{
     hotkey::LeaderHotkey,
     overlay::{show_overlay, OverlayConfig, OverlayResult},
 };
@@ -31,11 +31,11 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn run_windows() -> anyhow::Result<()> {
-    use windows::Win32::UI::WindowsAndMessaging::{
+    use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, TranslateMessage, MSG,
     };
 
-    let mut backend = keyhop_windows::WindowsBackend::new()?;
+    let mut backend = keyhop::windows::WindowsBackend::new()?;
     let leader = LeaderHotkey::register_default()?;
 
     println!("keyhop is running.");
@@ -71,7 +71,7 @@ fn run_windows() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn handle_leader(backend: &mut keyhop_windows::WindowsBackend) -> anyhow::Result<()> {
+fn handle_leader(backend: &mut keyhop::windows::WindowsBackend) -> anyhow::Result<()> {
     let elements = backend.enumerate_foreground()?;
     if elements.is_empty() {
         tracing::info!("no interactable elements in foreground window");

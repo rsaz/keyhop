@@ -10,36 +10,44 @@
 
 - Native performance and instant feel (sub-50ms hint overlay).
 - Semantic targeting via OS accessibility trees (UI Automation on Windows, AT-SPI on Linux).
-- Cross-platform core, thin platform-specific backends.
-- Publishable as reusable Rust crates so others can build alternative frontends.
+- Single, easy-to-install crate with platform backends gated behind `cfg`.
 
-## Workspace layout
+## Crate layout
 
 ```
 keyhop/
-├─ crates/
-│  ├─ keyhop-core/      # platform-agnostic types, traits, hint engine
-│  ├─ keyhop-windows/   # Windows backend (UI Automation, hooks, overlay)
-│  └─ keyhop/           # the binary that wires everything together
+├─ src/
+│  ├─ lib.rs        # public API: Action, Backend, Element, HintEngine
+│  ├─ main.rs       # the `keyhop` binary
+│  ├─ model.rs
+│  ├─ action.rs
+│  ├─ backend.rs
+│  ├─ hint.rs
+│  └─ windows/      # Windows backend (cfg(windows) only)
+│     ├─ mod.rs     # WindowsBackend (UI Automation)
+│     ├─ hotkey.rs  # global leader hotkey
+│     └─ overlay.rs # transparent layered overlay
+└─ examples/
+   └─ enumerate_foreground.rs
 ```
 
-`keyhop-core` and `keyhop-windows` are designed to be published independently to crates.io.
+One package, one publish: `keyhop` ships both the binary and a reusable library API. Linux / Wayland / macOS backends will land as additional `cfg`-gated modules under `src/`.
 
-## Build (Windows)
+## Install / build (Windows)
 
 Requires:
 - Rust stable with the `x86_64-pc-windows-msvc` toolchain
 - Visual Studio Build Tools with the "Desktop development with C++" workload
 
 ```powershell
-cargo build --workspace
-cargo run -p keyhop
-cargo run -p keyhop-windows --example enumerate_foreground
+cargo install --path .            # install the binary into ~/.cargo/bin
+cargo run --release               # run from source
+cargo run --example enumerate_foreground
 ```
 
 ## Using it
 
-Run `cargo run -p keyhop` (or `cargo run --release -p keyhop` for the snappy experience). The app sits in the terminal and registers a global hotkey:
+Run `cargo run` (or `cargo run --release` for the snappy experience). The app sits in the terminal and registers a global hotkey:
 
 | Action  | Keys                  |
 | ------- | --------------------- |
@@ -53,7 +61,7 @@ Switch focus to any app, hit the leader, then type the yellow label that appears
 
 ## Roadmap
 
-- [x] Workspace scaffold
+- [x] Single-crate scaffold
 - [x] Foreground window UI Automation tree walk
 - [x] Global leader hotkey + modal input
 - [x] Hint overlay (transparent layered window)
