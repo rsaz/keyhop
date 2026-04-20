@@ -10,6 +10,8 @@
 
 pub mod hotkey;
 pub mod overlay;
+pub mod tray;
+pub mod window_picker;
 
 use std::collections::HashMap;
 

@@ -1,10 +1,16 @@
-//! Thin wrapper around the [`global_hotkey`] crate that registers keyhop's
-//! leader chord and exposes a non-blocking poller for `Pressed` events.
+//! Multi-binding registry on top of the [`global_hotkey`] crate.
+//!
+//! [`Hotkeys`] owns a single [`GlobalHotKeyManager`] and a small map from
+//! the manager-assigned numeric id to a logical [`HotkeyAction`]. The owner
+//! polls [`Hotkeys::poll_actions`] inside its Win32 message loop and gets
+//! back a list of actions triggered since the last poll.
 //!
 //! The underlying [`GlobalHotKeyManager`] uses a hidden Win32 message-only
 //! window to receive `WM_HOTKEY`. The owning thread must therefore run a
 //! Win32 message loop (`GetMessageW` / `DispatchMessageW`) for events to be
 //! delivered. The `keyhop` binary takes care of that.
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use global_hotkey::{
@@ -12,62 +18,108 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 
-/// Owns a registered global hotkey for keyhop's leader. Drop releases the
-/// registration with the OS.
-pub struct LeaderHotkey {
-    manager: GlobalHotKeyManager,
-    hotkey: HotKey,
+/// What a registered chord should *do*. Decoupled from the specific
+/// modifier+key combination so we can rebind defaults later (or load from
+/// config) without touching dispatch code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HotkeyAction {
+    /// Show the hint overlay for elements inside the current foreground
+    /// window. Default: `Ctrl + Shift + Space`.
+    PickElement,
+    /// Show the hint overlay for every visible top-level window across all
+    /// monitors. Default: `Ctrl + Alt + Space`.
+    PickWindow,
 }
 
-impl LeaderHotkey {
-    /// Register keyhop's default leader chord: `Ctrl + Shift + Space`.
-    /// Chosen because it is rarely globally bound, has three modifiers (low
-    /// accidental-trigger risk), and is free of AltGr conflicts on European
-    /// keyboard layouts.
-    pub fn register_default() -> Result<Self> {
-        Self::register(Modifiers::CONTROL | Modifiers::SHIFT, Code::Space)
+/// Registered hotkeys. Drop releases all OS registrations.
+pub struct Hotkeys {
+    manager: GlobalHotKeyManager,
+    bindings: HashMap<u32, HotkeyAction>,
+    /// Held so we can unregister on drop.
+    registered: Vec<HotKey>,
+}
+
+impl Hotkeys {
+    /// Register keyhop's two default chords:
+    ///
+    /// - `Ctrl + Shift + Space` → [`HotkeyAction::PickElement`]
+    /// - `Ctrl + Alt + Space`   → [`HotkeyAction::PickWindow`]
+    ///
+    /// Chosen because they're rarely globally bound, share a memorable
+    /// "Ctrl + modifier + Space" pattern, and avoid the famous
+    /// `Ctrl+Shift+W` collision with browsers' "close window".
+    pub fn register_defaults() -> Result<Self> {
+        let mut me = Self::new()?;
+        me.register(
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            Code::Space,
+            HotkeyAction::PickElement,
+        )?;
+        me.register(
+            Modifiers::CONTROL | Modifiers::ALT,
+            Code::Space,
+            HotkeyAction::PickWindow,
+        )?;
+        Ok(me)
     }
 
-    /// Register an arbitrary modifier + key combination.
-    pub fn register(modifiers: Modifiers, code: Code) -> Result<Self> {
+    /// Construct an empty registry. Use [`Self::register`] to add bindings.
+    pub fn new() -> Result<Self> {
         let manager = GlobalHotKeyManager::new().context("creating GlobalHotKeyManager failed")?;
+        Ok(Self {
+            manager,
+            bindings: HashMap::new(),
+            registered: Vec::new(),
+        })
+    }
+
+    /// Add a single chord → action binding.
+    pub fn register(
+        &mut self,
+        modifiers: Modifiers,
+        code: Code,
+        action: HotkeyAction,
+    ) -> Result<()> {
         let hotkey = HotKey::new(Some(modifiers), code);
-        manager
+        self.manager
             .register(hotkey)
-            .context("registering global hotkey failed")?;
+            .with_context(|| format!("registering hotkey for {action:?}"))?;
         tracing::info!(
             ?modifiers,
             ?code,
+            ?action,
             id = hotkey.id(),
-            "leader hotkey registered"
+            "hotkey registered"
         );
-        Ok(Self { manager, hotkey })
+        self.bindings.insert(hotkey.id(), action);
+        self.registered.push(hotkey);
+        Ok(())
     }
 
-    /// The registered hotkey's id, useful for filtering events when multiple
-    /// hotkeys are registered.
-    pub fn id(&self) -> u32 {
-        self.hotkey.id()
-    }
-
-    /// Drain the global hotkey channel and return `true` if our leader was
-    /// pressed since the last poll. Released events are ignored.
-    pub fn poll_pressed(&self) -> bool {
+    /// Drain the global hotkey channel and return every action that fired
+    /// (in arrival order). Released events are ignored — keyhop only cares
+    /// about the press edge.
+    pub fn poll_actions(&self) -> Vec<HotkeyAction> {
         let receiver = GlobalHotKeyEvent::receiver();
-        let mut pressed = false;
+        let mut out = Vec::new();
         while let Ok(event) = receiver.try_recv() {
-            if event.id == self.hotkey.id() && event.state == HotKeyState::Pressed {
-                pressed = true;
+            if event.state != HotKeyState::Pressed {
+                continue;
+            }
+            if let Some(&action) = self.bindings.get(&event.id) {
+                out.push(action);
             }
         }
-        pressed
+        out
     }
 }
 
-impl Drop for LeaderHotkey {
+impl Drop for Hotkeys {
     fn drop(&mut self) {
-        if let Err(e) = self.manager.unregister(self.hotkey) {
-            tracing::warn!(error = %e, "failed to unregister leader hotkey");
+        for hk in self.registered.drain(..) {
+            if let Err(e) = self.manager.unregister(hk) {
+                tracing::warn!(error = %e, "failed to unregister hotkey");
+            }
         }
     }
 }

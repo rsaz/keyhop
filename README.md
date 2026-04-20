@@ -47,17 +47,18 @@ cargo run --example enumerate_foreground
 
 ## Using it
 
-Run `cargo run` (or `cargo run --release` for the snappy experience). The app sits in the terminal and registers a global hotkey:
+Run `cargo run` (or `cargo run --release` for the snappy experience). The app sits in the terminal and registers two global hotkeys:
 
-| Action  | Keys                  |
-| ------- | --------------------- |
-| Leader  | `Ctrl + Shift + Space` |
-| Confirm | type the hint label    |
-| Backspace | `Backspace`          |
-| Cancel  | `Esc` (inside overlay) |
-| Quit    | `Ctrl+C` in the terminal |
+| Action          | Keys                    | What it does                                                                 |
+| --------------- | ----------------------- | ---------------------------------------------------------------------------- |
+| Pick element    | `Ctrl + Shift + Space`  | Hints every interactable control inside the focused window. Type one to invoke it. |
+| Pick window     | `Ctrl + Alt + Space`    | Hints every visible top-level window across all monitors. Type one to focus it.   |
+| Confirm         | type the hint label     | Commits the selection.                                                       |
+| Backspace       | `Backspace`             | Drops the last typed character (inside an overlay).                          |
+| Cancel          | `Esc`                   | Dismisses the current overlay without doing anything.                        |
+| Quit            | `Ctrl + C`              | Stops `keyhop` (in the terminal).                                            |
 
-Switch focus to any app, hit the leader, then type the yellow label that appears on the control you want — `keyhop` invokes it via UI Automation.
+Switch focus to any app, hit the leader, then type the label that appears on whatever you want — `keyhop` invokes the control (yellow badges) or focuses the window (orange badges).
 
 ## Roadmap
 
@@ -66,6 +67,8 @@ Switch focus to any app, hit the leader, then type the yellow label that appears
 - [x] Global leader hotkey + modal input
 - [x] Hint overlay (transparent layered window)
 - [x] Invoke action dispatch
+- [x] Window picker mode (Alt-Tab with hints, all monitors)
+- [ ] System tray icon + menu
 - [ ] Click-through overlay so non-target apps still see the mouse
 - [ ] Multi-monitor / per-monitor DPI tuning
 - [ ] More actions (Focus, Type, Scroll)
