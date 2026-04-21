@@ -18,8 +18,8 @@ use tray_icon::{
 };
 
 /// What a tray menu click should do. A superset of
-/// [`super::hotkey::HotkeyAction`] — adds [`TrayCommand::Quit`] which has
-/// no hotkey equivalent (we don't want a global "quit keyhop" chord).
+/// [`super::hotkey::HotkeyAction`] — adds entries that have no hotkey
+/// equivalent (we don't want global "quit" or "open settings" chords).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     /// Same as `Ctrl+Shift+Space`: pick an interactable element in the
@@ -28,6 +28,9 @@ pub enum TrayCommand {
     /// Same as `Ctrl+Alt+Space`: pick a top-level window across all
     /// monitors and focus it.
     PickWindow,
+    /// Open the modal Settings window for editing hotkeys, hint
+    /// alphabet, colors, and Windows startup integration.
+    OpenSettings,
     /// Open the log file in notepad (release builds only).
     ViewLog,
     /// Ask the message loop to exit cleanly.
@@ -46,6 +49,7 @@ pub struct Tray {
     _tray: TrayIcon,
     pick_element_id: MenuId,
     pick_window_id: MenuId,
+    settings_id: MenuId,
     view_log_id: Option<MenuId>,
     quit_id: MenuId,
     _items: TrayItems,
@@ -57,6 +61,7 @@ struct TrayItems {
     _pick_element: MenuItem,
     _pick_window: MenuItem,
     _about: MenuItem,
+    _settings: MenuItem,
     _view_log: Option<MenuItem>,
     _quit: MenuItem,
 }
@@ -70,13 +75,14 @@ impl Tray {
         let pick_window = MenuItem::new("Pick window\tCtrl+Alt+Space", true, None);
         // Disabled label, just to expose the version inside the menu.
         let about = MenuItem::new(concat!("keyhop v", env!("CARGO_PKG_VERSION")), false, None);
-        
+        let settings = MenuItem::new("Settings...", true, None);
+
         // Only show "View Log" in release builds where logs go to a file.
         #[cfg(not(debug_assertions))]
         let view_log = Some(MenuItem::new("View Log", true, None));
         #[cfg(debug_assertions)]
         let view_log: Option<MenuItem> = None;
-        
+
         let quit = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
@@ -87,15 +93,16 @@ impl Tray {
             .context("appending Pick element item")?;
         menu.append(&pick_window)
             .context("appending Pick window item")?;
-        
+        menu.append(&PredefinedMenuItem::separator())
+            .context("appending separator")?;
+        menu.append(&settings).context("appending Settings item")?;
+
         #[cfg(not(debug_assertions))]
         if let Some(ref view_log_item) = view_log {
-            menu.append(&PredefinedMenuItem::separator())
-                .context("appending separator")?;
             menu.append(view_log_item)
                 .context("appending View Log item")?;
         }
-        
+
         menu.append(&PredefinedMenuItem::separator())
             .context("appending separator")?;
         menu.append(&quit).context("appending Quit item")?;
@@ -111,6 +118,7 @@ impl Tray {
 
         let pick_element_id = pick_element.id().clone();
         let pick_window_id = pick_window.id().clone();
+        let settings_id = settings.id().clone();
         let view_log_id = view_log.as_ref().map(|v| v.id().clone());
         let quit_id = quit.id().clone();
 
@@ -120,12 +128,14 @@ impl Tray {
             _tray: tray,
             pick_element_id,
             pick_window_id,
+            settings_id,
             view_log_id,
             quit_id,
             _items: TrayItems {
                 _pick_element: pick_element,
                 _pick_window: pick_window,
                 _about: about,
+                _settings: settings,
                 _view_log: view_log,
                 _quit: quit,
             },
@@ -144,7 +154,9 @@ impl Tray {
                 out.push(TrayCommand::PickElement);
             } else if event.id == self.pick_window_id {
                 out.push(TrayCommand::PickWindow);
-            } else if self.view_log_id.as_ref().map_or(false, |id| event.id == *id) {
+            } else if event.id == self.settings_id {
+                out.push(TrayCommand::OpenSettings);
+            } else if self.view_log_id.as_ref().is_some_and(|id| event.id == *id) {
                 out.push(TrayCommand::ViewLog);
             } else if event.id == self.quit_id {
                 out.push(TrayCommand::Quit);

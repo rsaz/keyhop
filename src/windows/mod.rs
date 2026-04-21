@@ -9,8 +9,11 @@
 //! items, ...) into the platform-agnostic [`crate::Element`] model.
 
 pub mod hotkey;
+pub mod notification;
 pub mod overlay;
+pub mod settings_window;
 pub mod single_instance;
+pub mod startup;
 pub mod tray;
 pub mod window_picker;
 
@@ -20,10 +23,10 @@ use anyhow::Context;
 
 use uiautomation::{
     patterns::{
-        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern,
+        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern, UIScrollPattern,
         UISelectionItemPattern, UITogglePattern,
     },
-    types::{ControlType, Handle},
+    types::{ControlType, Handle, ScrollAmount},
     UIAutomation, UIElement, UITreeWalker,
 };
 use windows::Win32::UI::HiDpi::{
@@ -129,7 +132,9 @@ impl Backend for WindowsBackend {
             Action::Type(s) => {
                 el.send_text(&s, 0).context("element.send_text() failed")?;
             }
-            Action::Scroll { .. } => anyhow::bail!("scroll action not yet implemented"),
+            Action::Scroll { dx, dy } => {
+                scroll_element(el, dx, dy).context("scrolling element failed")?;
+            }
         }
         Ok(())
     }
@@ -195,6 +200,55 @@ fn invoke_smart(el: &UIElement) -> anyhow::Result<InvokePath> {
     }
     el.click().context("element.click() failed")?;
     Ok(InvokePath::MouseFallback)
+}
+
+/// Scroll a UIA element by the requested pixel delta.
+///
+/// UIA exposes scroll in two modes:
+/// 1. Discrete amounts via [`UIScrollPattern::scroll`] — Page/Line/None,
+///    matching what Page-Up / arrow keys do natively. We map our pixel
+///    delta to the closest amount based on magnitude.
+/// 2. Continuous percent via [`UIScrollPattern::set_scroll_percent`]
+///    (0.0..=100.0). We don't use this here because we're given a pixel
+///    delta, not an absolute target — translating delta → percent would
+///    require querying viewport size which adds round-trips for little
+///    benefit.
+///
+/// Choice of amount per axis:
+/// - `|delta| >= 100` → page-sized scroll (large increment / decrement).
+/// - `0 < |delta| < 100` → small increment / decrement (one line).
+/// - `delta == 0` → `NoAmount` so the axis is skipped entirely.
+///
+/// Returns an error if the element doesn't support a scroll pattern at
+/// all — callers can decide whether to fall back to synthesized
+/// `WM_VSCROLL` (not implemented today; most modern controls expose UIA).
+fn scroll_element(el: &UIElement, dx: i32, dy: i32) -> anyhow::Result<()> {
+    let pattern = el
+        .get_pattern::<UIScrollPattern>()
+        .context("element does not support UIScrollPattern")?;
+
+    let h = pixel_delta_to_amount(dx);
+    let v = pixel_delta_to_amount(dy);
+    pattern
+        .scroll(h, v)
+        .context("UIScrollPattern::scroll failed")?;
+    tracing::debug!(dx, dy, ?h, ?v, "scrolled element via UIA");
+    Ok(())
+}
+
+fn pixel_delta_to_amount(delta: i32) -> ScrollAmount {
+    // Threshold chosen to match the "one mouse-wheel notch ≈ 100px"
+    // convention Windows uses for `WM_MOUSEWHEEL` (`WHEEL_DELTA == 120`).
+    // Anything bigger than that warrants a page-sized scroll; anything
+    // smaller is a line-sized nudge.
+    const PAGE_THRESHOLD: i32 = 100;
+    match delta {
+        0 => ScrollAmount::NoAmount,
+        d if d >= PAGE_THRESHOLD => ScrollAmount::LargeIncrement,
+        d if d <= -PAGE_THRESHOLD => ScrollAmount::LargeDecrement,
+        d if d > 0 => ScrollAmount::SmallIncrement,
+        _ => ScrollAmount::SmallDecrement,
+    }
 }
 
 impl WindowsBackend {

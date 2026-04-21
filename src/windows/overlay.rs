@@ -147,6 +147,63 @@ impl HintStyle {
             padding_y: 6,
         }
     }
+
+    /// Build the element-picker style, overriding any non-empty colors
+    /// from the user config. Empty strings keep the hardcoded defaults so
+    /// users can override one swatch at a time without filling out every
+    /// field in `config.toml`.
+    pub fn elements_from_config(c: &crate::config::BadgeColors) -> Self {
+        let mut style = Self::elements();
+        apply_color_override(&mut style.badge_bg, &c.badge_bg);
+        apply_color_override(&mut style.badge_fg, &c.badge_fg);
+        apply_color_override(&mut style.border, &c.border);
+        style
+    }
+
+    /// Like [`Self::elements_from_config`] but for the window picker.
+    pub fn windows_from_config(c: &crate::config::BadgeColors) -> Self {
+        let mut style = Self::windows();
+        apply_color_override(&mut style.badge_bg, &c.badge_bg);
+        apply_color_override(&mut style.badge_fg, &c.badge_fg);
+        apply_color_override(&mut style.border, &c.border);
+        style
+    }
+}
+
+fn apply_color_override(target: &mut COLORREF, hex: &str) {
+    if hex.trim().is_empty() {
+        return;
+    }
+    match parse_hex_color(hex) {
+        Ok(c) => *target = c,
+        Err(e) => {
+            tracing::warn!(value = %hex, error = ?e, "invalid color in config; keeping default");
+        }
+    }
+}
+
+/// Parse `"#RRGGBB"` or `"#RGB"` (with or without the `#`) into a
+/// Win32 [`COLORREF`]. Win32 stores colors as `0x00BBGGRR`, so we swap
+/// the byte order from web-style RGB.
+pub fn parse_hex_color(s: &str) -> anyhow::Result<COLORREF> {
+    let trimmed = s.trim().trim_start_matches('#');
+    let (r, g, b) = match trimmed.len() {
+        6 => {
+            let r = u8::from_str_radix(&trimmed[0..2], 16)?;
+            let g = u8::from_str_radix(&trimmed[2..4], 16)?;
+            let b = u8::from_str_radix(&trimmed[4..6], 16)?;
+            (r, g, b)
+        }
+        3 => {
+            let r = u8::from_str_radix(&trimmed[0..1], 16)? * 0x11;
+            let g = u8::from_str_radix(&trimmed[1..2], 16)? * 0x11;
+            let b = u8::from_str_radix(&trimmed[2..3], 16)? * 0x11;
+            (r, g, b)
+        }
+        _ => anyhow::bail!("hex color must be #RGB or #RRGGBB, got '{s}'"),
+    };
+    let bgr = ((b as u32) << 16) | ((g as u32) << 8) | (r as u32);
+    Ok(COLORREF(bgr))
 }
 
 /// One hint after layout resolution, in client coordinates. We compute
@@ -582,4 +639,37 @@ pub fn pick_hint(hints: Vec<Hint>, style: HintStyle) -> Result<Option<usize>> {
 
     let state = unsafe { Box::from_raw(state_ptr) };
     Ok(state.selected)
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn parses_six_digit_hex() {
+        let c = parse_hex_color("#FFE500").unwrap();
+        assert_eq!(c.0, 0x0000E5FF);
+    }
+
+    #[test]
+    fn parses_three_digit_hex() {
+        let c = parse_hex_color("#F00").unwrap();
+        assert_eq!(c.0, 0x000000FF);
+    }
+
+    #[test]
+    fn parses_without_hash() {
+        let c = parse_hex_color("FFFFFF").unwrap();
+        assert_eq!(c.0, 0x00FFFFFF);
+    }
+
+    #[test]
+    fn rejects_bad_length() {
+        assert!(parse_hex_color("#FFFF").is_err());
+    }
+
+    #[test]
+    fn rejects_non_hex() {
+        assert!(parse_hex_color("#GGHHII").is_err());
+    }
 }

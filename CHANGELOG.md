@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-21
+
+Configuration & robustness release. Everything stays inside the tray —
+the new Settings dialog means you no longer have to hand-edit any files.
+
+### Added
+- **Visual Settings dialog** reachable from the tray icon
+  (`Settings...`). Lets you change hotkeys, hint alphabet, overlay
+  colors, and Windows startup integration without ever touching a
+  config file. Validates input on Save, shows clear error dialogs for
+  invalid hotkeys / hex colors, and offers a `Reset to Defaults`
+  button.
+- **TOML config file** at `%APPDATA%\keyhop\config.toml`. Missing or
+  malformed configs gracefully fall back to the v0.1.0 defaults so
+  upgrades are non-disruptive.
+- **Customizable hotkey chords** via a new parser that accepts
+  `Ctrl`/`Control`/`Shift`/`Alt`/`Win`/`Super` modifiers plus any
+  letter, digit, F-key, arrow, space, enter, or punctuation key
+  (`Ctrl+Alt+K`, `Win+F12`, etc.) — case-insensitive, whitespace
+  tolerant.
+- **Hotkey conflict detection** — if another app already owns one of
+  your chords, keyhop surfaces a notification dialog naming the
+  conflicting chord and continues running with whatever did register.
+- **Customizable hint alphabet** (default `asdfghjkl`).
+- **Customizable overlay colors** (`#RRGGBB` hex). Element badge
+  background and window badge background are exposed in the dialog;
+  power users can override foreground and border colors directly in
+  the TOML file.
+- **Windows startup integration** — `Launch keyhop at Windows startup`
+  checkbox writes / removes a per-user entry in
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (no admin
+  required). The checkbox state mirrors the registry, not the config,
+  so it stays accurate even if the registry is changed externally.
+- **`Action::Scroll` implemented** for the Windows backend via the
+  UIA `UIScrollPattern`. Pixel deltas are mapped to `LargeIncrement` /
+  `SmallIncrement` based on magnitude (threshold matches Windows'
+  `WHEEL_DELTA == 120` convention).
+- **User-facing notifications** for "no interactive elements found",
+  "no visible windows", action failures, and hotkey conflicts. All
+  surface through `MessageBoxW` so they're visible even when the
+  release build runs without a console.
+- **`Settings...` and `View Log` items in the tray menu** (the latter
+  in release builds only).
+
+### Changed
+- Hint engine, element style, and window style are now built once at
+  startup from the loaded config and threaded through the picker
+  handlers, replacing the previous `HintEngine::default()` /
+  `HintStyle::elements()` calls scattered through `main.rs`.
+- Startup banner now prints whichever hotkey chords are currently
+  registered, so it stays accurate when the user customizes them.
+
+### Internals
+- New modules: `src/config.rs`, `src/windows/notification.rs`,
+  `src/windows/settings_window.rs`, `src/windows/startup.rs`.
+- New deps: `serde`, `toml`. New `windows` feature flags:
+  `Win32_System_Registry`, `Win32_UI_Shell`, `Win32_UI_Controls`.
+- 13 new unit tests covering hotkey-chord parsing, hex-color parsing,
+  and TOML config round-tripping.
+
 ## [0.1.0] - 2026-04-20
 
 Initial public release. Windows-only.
@@ -53,5 +113,6 @@ Initial public release. Windows-only.
 - Only the `Invoke` action is dispatched. `Focus`, `Type`, and
   `Scroll` are stubs.
 
-[Unreleased]: https://github.com/rsaz/keyhop/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rsaz/keyhop/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rsaz/keyhop/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rsaz/keyhop/releases/tag/v0.1.0

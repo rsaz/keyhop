@@ -20,6 +20,7 @@
 
 pub mod action;
 pub mod backend;
+pub mod config;
 pub mod hint;
 pub mod model;
 
@@ -28,5 +29,6 @@ pub mod windows;
 
 pub use action::Action;
 pub use backend::Backend;
+pub use config::Config;
 pub use hint::{HintEngine, DEFAULT_ALPHABET};
 pub use model::{Bounds, Element, ElementId, Role};

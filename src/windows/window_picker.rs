@@ -185,17 +185,41 @@ unsafe fn visible_frame(hwnd: HWND) -> Option<Bounds> {
 }
 
 /// Show the window picker overlay and return the chosen window's HWND, or
-/// `None` if the user cancelled / no candidates exist.
+/// `None` if the user cancelled / no candidates exist. Uses the default
+/// hint engine and window style — call [`pick_with_style`] when the
+/// caller needs to inject a config-driven style.
 ///
 /// The labels are placed at the top-left of each window's visible frame
 /// (i.e. anchored to the title bar), which is predictable and rarely
 /// hidden by the window's own content.
 pub fn pick(windows: Vec<TopLevelWindow>) -> Result<Option<TopLevelWindow>> {
+    pick_with(windows, &HintEngine::default(), HintStyle::windows())
+}
+
+/// Variant of [`pick`] that uses a caller-provided [`HintStyle`]. The
+/// hint alphabet still comes from the default engine — Settings only
+/// exposes alphabet via the element picker side, but both pickers share
+/// it so behaviour stays consistent.
+pub fn pick_with_style(
+    windows: Vec<TopLevelWindow>,
+    style: HintStyle,
+) -> Result<Option<TopLevelWindow>> {
+    pick_with(windows, &HintEngine::default(), style)
+}
+
+/// Fully-parameterised picker. Used internally by [`pick`] and
+/// [`pick_with_style`]; exposed in case future callers need to override
+/// both the engine and the style at the same time.
+pub fn pick_with(
+    windows: Vec<TopLevelWindow>,
+    engine: &HintEngine,
+    style: HintStyle,
+) -> Result<Option<TopLevelWindow>> {
     if windows.is_empty() {
         return Ok(None);
     }
 
-    let labels = HintEngine::default().generate(windows.len());
+    let labels = engine.generate(windows.len());
     let hints: Vec<Hint> = windows
         .iter()
         .zip(labels.iter())
@@ -208,7 +232,7 @@ pub fn pick(windows: Vec<TopLevelWindow>) -> Result<Option<TopLevelWindow>> {
         })
         .collect();
 
-    match pick_hint(hints, HintStyle::windows())? {
+    match pick_hint(hints, style)? {
         Some(idx) => Ok(Some(windows.into_iter().nth(idx).unwrap())),
         None => Ok(None),
     }

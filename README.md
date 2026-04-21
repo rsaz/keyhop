@@ -4,7 +4,7 @@
 
 `keyhop` is a system-wide keyboard navigation layer that lets you control your whole computer without ever touching the mouse. Reaching for the mouse forces a constant context switch between thinking and pointing — your hands leave the home row, your eyes hunt for a cursor, and your flow breaks. `keyhop` keeps you on the keyboard so you stay fast, focused, and productive, using OS accessibility APIs (UI Automation on Windows) to target native UI elements semantically.
 
-**Status:** v0.1.0 — Windows backend. Linux backend planned.
+**Status:** v0.2.0 — Windows backend with visual configuration, customizable hotkeys/colors/alphabet, and Windows startup integration. Linux backend planned.
 
 [![ci](https://github.com/rsaz/keyhop/actions/workflows/ci.yml/badge.svg)](https://github.com/rsaz/keyhop/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/keyhop.svg)](https://crates.io/crates/keyhop)
@@ -28,11 +28,15 @@ keyhop/
 │  ├─ action.rs
 │  ├─ backend.rs
 │  ├─ hint.rs
+│  ├─ config.rs            # TOML config (%APPDATA%/keyhop/config.toml)
 │  └─ windows/             # Windows backend (cfg(windows) only)
 │     ├─ mod.rs            # WindowsBackend (UI Automation tree walk)
-│     ├─ hotkey.rs         # global leader hotkeys
-│     ├─ overlay.rs        # transparent layered hint overlay
+│     ├─ hotkey.rs         # global leader hotkeys + chord parser
+│     ├─ overlay.rs        # transparent layered hint overlay + color parser
 │     ├─ tray.rs           # system tray icon + context menu
+│     ├─ settings_window.rs # visual Settings dialog (Win32)
+│     ├─ startup.rs        # "launch at login" via HKCU Run key
+│     ├─ notification.rs   # MessageBox-backed user notifications
 │     └─ window_picker.rs  # Alt-Tab-style window picker
 └─ examples/
    └─ enumerate_foreground.rs
@@ -81,20 +85,62 @@ The binary uses the Windows GUI subsystem in release builds, running silently in
 
 ## Using it
 
-After launching, `keyhop` registers two global hotkeys and a tray icon:
+After launching, `keyhop` registers two global hotkeys and a tray icon. The default chords below can be changed from `Settings...` in the tray menu — see [Configuration](#configuration).
 
-| Action          | Keys                    | What it does                                                                       |
+| Action          | Default keys            | What it does                                                                       |
 | --------------- | ----------------------- | ---------------------------------------------------------------------------------- |
 | Pick element    | `Ctrl + Shift + Space`  | Hints every interactable control inside the focused window. Type one to invoke it. |
 | Pick window     | `Ctrl + Alt + Space`    | Hints every visible top-level window across all monitors. Type one to focus it.    |
 | Confirm         | type the hint label     | Commits the selection.                                                             |
 | Backspace       | `Backspace`             | Drops the last typed character (inside an overlay).                                |
 | Cancel          | `Esc`                   | Dismisses the current overlay without doing anything.                              |
+| Settings        | Tray menu → Settings... | Open the visual configuration dialog.                                              |
 | Quit            | Tray menu → Quit        | Cleanly exits `keyhop`.                                                            |
 
-The tray icon's right-click menu mirrors the two leader chords plus a Quit entry, so you can drive `keyhop` even if you forget the hotkeys.
+The tray icon's right-click menu mirrors the two leader chords, gives you a `Settings...` entry to customize keyhop visually, and (in release builds) a `View Log` shortcut so you can debug without leaving the keyboard.
 
-Yellow badges = element picker (will *invoke* the control). Orange badges = window picker (will *focus* the window). Both show the hint letters on the home row by default.
+Yellow badges = element picker (will *invoke* the control). Orange badges = window picker (will *focus* the window). Both show the hint letters on the home row by default — but as of v0.2.0 you can change the colors and the alphabet from `Settings...`.
+
+## Configuration
+
+`keyhop` is configured through a small visual dialog reachable from the tray icon (`Settings...`), so you never have to touch a config file unless you want to. The dialog lets you change:
+
+- **Hotkeys** — both leader chords. Type any combination of `Ctrl`, `Shift`, `Alt`, `Win`/`Super` modifiers plus a key (`A`-`Z`, `0`-`9`, `F1`-`F24`, `Space`, arrow keys, punctuation, etc.). Example: `Ctrl+Alt+K`.
+- **Hint alphabet** — the characters used to build hint labels. Default `asdfghjkl` (the home row).
+- **Overlay colors** — element badge background and window badge background, as `#RRGGBB` hex.
+- **Launch at Windows startup** — toggles a per-user entry in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (no admin rights required).
+
+`Save` validates everything (invalid hotkey strings or hex colors are rejected up-front), writes `%APPDATA%\keyhop\config.toml`, and shows a confirmation. `Reset to Defaults` deletes the config file. Hotkey, alphabet, and color changes apply on the next launch; the startup toggle takes effect immediately.
+
+If a configured hotkey is already in use by another app at startup, keyhop reports the conflict via a notification dialog and continues running with the surviving chord (e.g. if pick-window conflicts but pick-element doesn't, the latter still works). Open `Settings...` to choose a different combination.
+
+### config.toml format (for power users)
+
+The Settings dialog is the recommended path, but `%APPDATA%\keyhop\config.toml` is plain TOML if you prefer to script it:
+
+```toml
+[hotkeys]
+pick_element = "Ctrl+Shift+Space"
+pick_window  = "Ctrl+Alt+Space"
+
+[hints]
+alphabet = "asdfghjkl"
+
+[colors.element]
+badge_bg = "#FFE500"   # leave empty to keep the default
+badge_fg = ""
+border   = ""
+
+[colors.window]
+badge_bg = "#33AAFF"
+badge_fg = ""
+border   = ""
+
+[startup]
+launch_at_startup = false
+```
+
+Missing keys, missing sections, and an entirely missing file all fall back to the v0.1.0 defaults. Malformed TOML is logged and ignored — keyhop will start with defaults rather than refuse to run.
 
 ## Library use
 
@@ -133,11 +179,22 @@ fn enumerate() -> anyhow::Result<()> {
 - [x] Single-instance guard
 - [x] GUI-subsystem release builds (hidden console, file logging)
 
-### Next up (v0.2.0)
+### Shipped (v0.2.0)
 
-- [ ] Configurable hotkeys, colors, and hint alphabet via a TOML config file
-- [ ] More UIA actions wired through (`Focus`, `Type`, `Scroll`)
+- [x] Visual Settings dialog (no `.toml` editing required)
+- [x] Configurable hotkeys via `%APPDATA%\keyhop\config.toml` with chord parser
+- [x] Configurable hint alphabet
+- [x] Configurable overlay colors (`#RRGGBB`)
+- [x] Hotkey conflict detection with user notification
+- [x] Windows startup integration via `HKCU\...\Run` (no admin)
+- [x] Scroll action wired through UIA `UIScrollPattern`
+- [x] User-facing notifications (no elements found, hotkey conflict, action failed)
+
+### Next up (v0.3.0)
+
 - [ ] Polished tray icon (multi-resolution `.ico` instead of the procedural badge)
+- [ ] Hot-reload config without restarting (re-register hotkeys at runtime)
+- [ ] Per-color overrides exposed in the Settings dialog (today only badge backgrounds are editable)
 
 ### Future
 
