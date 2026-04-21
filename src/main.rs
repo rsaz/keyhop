@@ -9,8 +9,9 @@
 //!
 //! Both actions are also exposed through a system tray icon (right-click
 //! the yellow "K" badge in the notification area). `Esc` cancels either
-//! overlay; the tray's `Quit` entry — or `Ctrl+C` in this terminal — exits
-//! the message loop.
+//! overlay; the tray's `Quit` entry exits the message loop.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::process::ExitCode;
 
@@ -155,10 +156,21 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     println!("  Pick element : Ctrl + Shift + Space");
     println!("  Pick window  : Ctrl + Alt   + Space");
     println!("  Cancel       : Esc (inside overlay)");
-    if tray.is_some() {
-        println!("  Quit         : Tray menu → Quit, or Ctrl + C in this terminal");
-    } else {
-        println!("  Quit         : Ctrl + C in this terminal");
+    #[cfg(debug_assertions)]
+    {
+        if tray.is_some() {
+            println!("  Quit         : Tray menu → Quit, or Ctrl + C in this terminal");
+        } else {
+            println!("  Quit         : Ctrl + C in this terminal");
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        if tray.is_some() {
+            println!("  Quit         : Tray menu → Quit");
+        } else {
+            println!("  Quit         : (no tray available)");
+        }
     }
     println!();
     println!("Switch focus to any app, then press a leader.");
@@ -196,6 +208,16 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
                         if let Err(e) = handle_pick_window() {
                             tracing::error!(error = ?e, "tray PickWindow failed");
                         }
+                    }
+                    #[cfg(not(debug_assertions))]
+                    TrayCommand::ViewLog => {
+                        if let Err(e) = open_log_file() {
+                            tracing::error!(error = ?e, "failed to open log file");
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    TrayCommand::ViewLog => {
+                        // ViewLog shouldn't be available in debug builds, but handle it gracefully
                     }
                     TrayCommand::Quit => {
                         tracing::info!("quit requested from tray");
@@ -278,5 +300,52 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+
+    #[cfg(debug_assertions)]
+    {
+        fmt().with_env_filter(filter).with_target(false).init();
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        use std::fs;
+        use tracing_appender::rolling;
+        
+        if let Some(log_path) = get_log_file_path() {
+            if let Some(parent) = log_path.parent() {
+                if fs::create_dir_all(parent).is_ok() {
+                    let file_appender = rolling::never(parent, "keyhop.log");
+                    fmt()
+                        .with_env_filter(filter)
+                        .with_target(false)
+                        .with_writer(file_appender)
+                        .init();
+                    return;
+                }
+            }
+        }
+        fmt().with_env_filter(filter).with_target(false).init();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn get_log_file_path() -> Option<std::path::PathBuf> {
+    use std::env;
+    let appdata = env::var("LOCALAPPDATA").ok()?;
+    let mut path = std::path::PathBuf::from(appdata);
+    path.push("keyhop");
+    path.push("keyhop.log");
+    Some(path)
+}
+
+#[cfg(not(debug_assertions))]
+fn open_log_file() -> anyhow::Result<()> {
+    if let Some(log_path) = get_log_file_path() {
+        if log_path.exists() {
+            std::process::Command::new("notepad.exe")
+                .arg(&log_path)
+                .spawn()?;
+        }
+    }
+    Ok(())
 }

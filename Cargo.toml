@@ -17,6 +17,7 @@ categories = ["accessibility", "gui", "os"]
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Windows-only deps. Non-Windows targets compile the lib without these (and
 # without the `crate::windows` module), which keeps `cargo check` honest on

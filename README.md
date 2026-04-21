@@ -63,13 +63,13 @@ Requires:
 ## Run
 
 ```powershell
-keyhop                         # release install
-cargo run --release            # from source
-cargo run                      # debug build (keeps console window)
+keyhop                         # release install (no console, logs to file)
+cargo run --release            # from source (no console, logs to file)
+cargo run                      # debug build (shows console with live logs)
 cargo run --example enumerate_foreground
 ```
 
-In v0.1.0 the binary launches in console mode — running `keyhop` opens a small terminal window where startup logs and tracing output appear. The yellow `K` tray icon is the user-facing control surface; the console is mainly there for visibility and `Ctrl + C` quit. A future release will switch to the GUI subsystem and hide the console.
+The binary uses the Windows GUI subsystem in release builds, running silently in the background with no console window. Logs are written to `%LOCALAPPDATA%\keyhop\keyhop.log` and can be viewed via the tray menu's "View Log" option. Debug builds (`cargo run` without `--release`) still show a console window for development convenience.
 
 ### Flags
 
@@ -90,7 +90,7 @@ After launching, `keyhop` registers two global hotkeys and a tray icon:
 | Confirm         | type the hint label     | Commits the selection.                                                             |
 | Backspace       | `Backspace`             | Drops the last typed character (inside an overlay).                                |
 | Cancel          | `Esc`                   | Dismisses the current overlay without doing anything.                              |
-| Quit            | Tray menu → Quit        | Cleanly exits `keyhop` (also `Ctrl + C` if launched from a terminal).              |
+| Quit            | Tray menu → Quit        | Cleanly exits `keyhop`.                                                            |
 
 The tray icon's right-click menu mirrors the two leader chords plus a Quit entry, so you can drive `keyhop` even if you forget the hotkeys.
 
@@ -131,10 +131,10 @@ fn enumerate() -> anyhow::Result<()> {
 - [x] System tray icon + context menu
 - [x] CLI flags (`--version`, `--help`, `--no-tray`)
 - [x] Single-instance guard
+- [x] GUI-subsystem release builds (hidden console, file logging)
 
 ### Next up (v0.2.0)
 
-- [ ] GUI-subsystem release build (hide the console window) with parent-console attach for `--help`/`--version`
 - [ ] Configurable hotkeys, colors, and hint alphabet via a TOML config file
 - [ ] More UIA actions wired through (`Focus`, `Type`, `Scroll`)
 - [ ] Polished tray icon (multi-resolution `.ico` instead of the procedural badge)

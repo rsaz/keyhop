@@ -28,6 +28,8 @@ pub enum TrayCommand {
     /// Same as `Ctrl+Alt+Space`: pick a top-level window across all
     /// monitors and focus it.
     PickWindow,
+    /// Open the log file in notepad (release builds only).
+    ViewLog,
     /// Ask the message loop to exit cleanly.
     Quit,
 }
@@ -44,6 +46,7 @@ pub struct Tray {
     _tray: TrayIcon,
     pick_element_id: MenuId,
     pick_window_id: MenuId,
+    view_log_id: Option<MenuId>,
     quit_id: MenuId,
     _items: TrayItems,
 }
@@ -54,6 +57,7 @@ struct TrayItems {
     _pick_element: MenuItem,
     _pick_window: MenuItem,
     _about: MenuItem,
+    _view_log: Option<MenuItem>,
     _quit: MenuItem,
 }
 
@@ -66,6 +70,13 @@ impl Tray {
         let pick_window = MenuItem::new("Pick window\tCtrl+Alt+Space", true, None);
         // Disabled label, just to expose the version inside the menu.
         let about = MenuItem::new(concat!("keyhop v", env!("CARGO_PKG_VERSION")), false, None);
+        
+        // Only show "View Log" in release builds where logs go to a file.
+        #[cfg(not(debug_assertions))]
+        let view_log = Some(MenuItem::new("View Log", true, None));
+        #[cfg(debug_assertions)]
+        let view_log: Option<MenuItem> = None;
+        
         let quit = MenuItem::new("Quit", true, None);
 
         let menu = Menu::new();
@@ -76,6 +87,15 @@ impl Tray {
             .context("appending Pick element item")?;
         menu.append(&pick_window)
             .context("appending Pick window item")?;
+        
+        #[cfg(not(debug_assertions))]
+        if let Some(ref view_log_item) = view_log {
+            menu.append(&PredefinedMenuItem::separator())
+                .context("appending separator")?;
+            menu.append(view_log_item)
+                .context("appending View Log item")?;
+        }
+        
         menu.append(&PredefinedMenuItem::separator())
             .context("appending separator")?;
         menu.append(&quit).context("appending Quit item")?;
@@ -91,6 +111,7 @@ impl Tray {
 
         let pick_element_id = pick_element.id().clone();
         let pick_window_id = pick_window.id().clone();
+        let view_log_id = view_log.as_ref().map(|v| v.id().clone());
         let quit_id = quit.id().clone();
 
         tracing::info!("tray icon registered");
@@ -99,11 +120,13 @@ impl Tray {
             _tray: tray,
             pick_element_id,
             pick_window_id,
+            view_log_id,
             quit_id,
             _items: TrayItems {
                 _pick_element: pick_element,
                 _pick_window: pick_window,
                 _about: about,
+                _view_log: view_log,
                 _quit: quit,
             },
         })
@@ -121,6 +144,8 @@ impl Tray {
                 out.push(TrayCommand::PickElement);
             } else if event.id == self.pick_window_id {
                 out.push(TrayCommand::PickWindow);
+            } else if self.view_log_id.as_ref().map_or(false, |id| event.id == *id) {
+                out.push(TrayCommand::ViewLog);
             } else if event.id == self.quit_id {
                 out.push(TrayCommand::Quit);
             }
