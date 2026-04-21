@@ -190,18 +190,30 @@ fn enumerate() -> anyhow::Result<()> {
 - [x] Scroll action wired through UIA `UIScrollPattern`
 - [x] User-facing notifications (no elements found, hotkey conflict, action failed)
 
-### Next up (v0.3.0)
+### Next up (v0.3.0) — Linux backend
+
+- [ ] Linux backend via AT-SPI (X11 first, then Wayland)
+- [ ] Linux global hotkey integration (X11 `XGrabKey` / Wayland portal)
+- [ ] Linux overlay rendering (X11 `_NET_WM_STATE_ABOVE` layered window first; layer-shell on Wayland later)
+- [ ] Linux tray icon via the StatusNotifierItem / AppIndicator protocol
+- [ ] Smoke-test on GNOME (Wayland), KDE (X11), and a tiling WM (i3 or Sway)
+
+### v0.4.0 — macOS backend
+
+- [ ] macOS backend via the Accessibility API (`AXUIElement`)
+- [ ] macOS global hotkeys via `RegisterEventHotKey` / `MASShortcut`-style API
+- [ ] macOS overlay (`NSWindow` with `NSWindowCollectionBehaviorCanJoinAllSpaces`)
+- [ ] macOS menu bar item with the same Settings / Pick / Quit affordances as the Windows tray
+- [ ] Notarized `.app` bundle build pipeline
+
+### v0.5.0 — Polish, click-through, installers
 
 - [ ] Polished tray icon (multi-resolution `.ico` instead of the procedural badge)
 - [ ] Hot-reload config without restarting (re-register hotkeys at runtime)
 - [ ] Per-color overrides exposed in the Settings dialog (today only badge backgrounds are editable)
-
-### Future
-
 - [ ] Click-through overlay so non-target apps still see the mouse
-- [ ] MSI installer and a Winget manifest
-- [ ] Linux backend (X11 first, then Wayland) via AT-SPI
-- [ ] macOS backend via the Accessibility API
+- [ ] MSI installer + Winget manifest (Windows)
+- [ ] Linux installer story: `.deb` + `.rpm` packages, plus a Flatpak manifest
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
