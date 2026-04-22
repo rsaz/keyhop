@@ -16,3 +16,6 @@ Thumbs.db
 # Logs / temp
 *.log
 *.pdb
+*.tmp
+.relnotes.tmp
+.commitmsg.tmp

@@ -31,9 +31,8 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, FindWindowW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, CW_USEDEFAULT, HWND_DESKTOP, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WNDCLASSEXW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, FindWindowW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    CW_USEDEFAULT, HWND_DESKTOP, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WNDCLASSEXW, WS_OVERLAPPED,
 };
 
 /// Class name for the hidden IPC window. Must match between the running

@@ -493,11 +493,7 @@ fn get_latest_log_file() -> Option<std::path::PathBuf> {
     let entries = fs::read_dir(&dir).ok()?;
     entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("keyhop")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("keyhop"))
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
             let modified = meta.modified().ok()?;
@@ -556,9 +552,7 @@ fn run_close_command() -> ExitCode {
 fn run_clear_logs_command() -> ExitCode {
     #[cfg(debug_assertions)]
     {
-        eprintln!(
-            "keyhop: --clear-logs has nothing to do in debug builds (logs go to stderr)."
-        );
+        eprintln!("keyhop: --clear-logs has nothing to do in debug builds (logs go to stderr).");
         ExitCode::SUCCESS
     }
     #[cfg(not(debug_assertions))]
@@ -593,15 +587,15 @@ fn run_clear_logs_command() -> ExitCode {
                     // file open with FILE_SHARE_READ but not _DELETE.
                     // Worth surfacing so the user knows to run --close
                     // first or shut down via the tray.
-                    eprintln!(
-                        "keyhop: could not delete {}: {e}",
-                        entry.path().display()
-                    );
+                    eprintln!("keyhop: could not delete {}: {e}", entry.path().display());
                     errors += 1;
                 }
             }
         }
-        println!("keyhop: removed {removed} log file(s) from {}.", dir.display());
+        println!(
+            "keyhop: removed {removed} log file(s) from {}.",
+            dir.display()
+        );
         if errors > 0 {
             eprintln!(
                 "keyhop: {errors} file(s) could not be deleted (is keyhop still running? \

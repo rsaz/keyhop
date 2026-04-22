@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **CI: bump `actions/checkout` from v4 to v6.** v4 runs on Node.js 20,
+  which GitHub is forcing to Node.js 24 in June 2026 and removing
+  entirely in September 2026. v6 ships a Node.js 24 runtime and silences
+  the deprecation warning that was surfacing on every CI run.
+- **Refresh `Cargo.lock`** (`winnow` 1.0.1 → 1.0.2). No code change; this
+  is the routine compatible-update sweep so transitive crates stay
+  current.
+
+### Added
+- **`.github/dependabot.yml`.** Weekly checks for both `cargo` and
+  `github-actions` ecosystems so the `actions/checkout`-style drift
+  doesn't recur and Cargo advisories surface as PRs we can review.
+
+### Security
+- **Dismiss GHSA-wrw7-89jp-8q8g (`glib < 0.20.0` `VariantStrIter`
+  unsoundness, RUSTSEC-2024-0429) as `tolerable_risk`.** The vulnerable
+  `glib` 0.18 only enters the dependency graph through
+  `tray-icon` → `libappindicator` → `gtk` → `glib` on non-Windows
+  targets. `tray-icon` is gated by
+  `[target.'cfg(windows)'.dependencies]` in `Cargo.toml` (with
+  `default-features = false`, which already strips the `libxdo` X11
+  backend), so on `x86_64-pc-windows-msvc` — the only target keyhop
+  ships — `glib` is never compiled and the unsound `VariantStrIter`
+  code path is unreachable. `tray-icon` 0.22 is the latest release and
+  SemVer-locks `gtk-rs` 0.18; an upstream bump to gtk-rs 0.20 is
+  required before the lockfile can drop the warning, hence the
+  dismissal rather than a `cargo update` fix.
+
 ## [0.3.0] - 2026-04-22
 
 Browser web-content release. The element picker now actually finds the
