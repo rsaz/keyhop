@@ -1,7 +1,7 @@
 [package]
 name = "keyhop"
 description = "System-wide keyboard navigation overlay: drive your desktop without the mouse."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT OR Apache-2.0"

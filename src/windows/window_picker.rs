@@ -50,6 +50,11 @@ pub struct TopLevelWindow {
 // across threads is fine in practice.
 unsafe impl Send for TopLevelWindow {}
 
+struct EnumData {
+    windows: Vec<TopLevelWindow>,
+    total: usize,
+}
+
 /// Enumerate every visible, user-pickable top-level window.
 ///
 /// Filters applied (in order, cheapest first):
@@ -66,24 +71,33 @@ unsafe impl Send for TopLevelWindow {}
 ///   the user means to pick).
 /// - Frame must have positive area.
 pub fn enumerate_visible() -> Result<Vec<TopLevelWindow>> {
-    let mut out: Vec<TopLevelWindow> = Vec::with_capacity(32);
-    let out_ptr: *mut Vec<TopLevelWindow> = &mut out;
+    let mut data = EnumData {
+        windows: Vec::with_capacity(32),
+        total: 0,
+    };
+    let data_ptr: *mut EnumData = &mut data;
 
-    // SAFETY: We pass our Vec via LPARAM; the callback's lifetime is
+    // SAFETY: We pass our data via LPARAM; the callback's lifetime is
     // bounded by EnumWindows itself, which is synchronous.
     unsafe {
-        EnumWindows(Some(enum_proc), LPARAM(out_ptr as isize)).context("EnumWindows failed")?;
+        EnumWindows(Some(enum_proc), LPARAM(data_ptr as isize)).context("EnumWindows failed")?;
     }
 
-    tracing::debug!(count = out.len(), "enumerate_visible");
-    Ok(out)
+    tracing::debug!(
+        found = data.windows.len(),
+        total = data.total,
+        filtered = data.total - data.windows.len(),
+        "enumerate_visible complete"
+    );
+    Ok(data.windows)
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let out = &mut *(lparam.0 as *mut Vec<TopLevelWindow>);
+    let data = &mut *(lparam.0 as *mut EnumData);
+    data.total += 1;
 
     if let Some(w) = describe(hwnd) {
-        out.push(w);
+        data.windows.push(w);
     }
     // Always continue enumeration, even on errors for individual windows.
     BOOL(1)
@@ -94,7 +108,20 @@ unsafe fn describe(hwnd: HWND) -> Option<TopLevelWindow> {
         return None;
     }
 
-    // Skip cloaked windows (closed UWP apps leave these around).
+    // Skip *any* cloaked window. In practice, cloaked != 0 covers:
+    // - DWM_CLOAKED_APP (1): hidden by the app itself.
+    // - DWM_CLOAKED_SHELL (2): suspended by the shell. On Win10/11 this is
+    //   what you get for backgrounded UWP apps the user opened months ago
+    //   (Calculator, Media Player, Settings, Photos, …) — they show up in
+    //   `EnumWindows` even though the user hasn't touched them in this
+    //   session, and including them clutters the picker with apps that
+    //   aren't actually visible on any monitor.
+    // - DWM_CLOAKED_INHERITED (4): inherited from owner.
+    //
+    // True "this window is on another Windows virtual desktop" is also
+    // surfaced as cloaked=2, but excluding those is the lesser of two
+    // evils: most users don't run multiple virtual desktops, and the ones
+    // that do can switch desktops with Win+Ctrl+Arrow first.
     let mut cloaked: u32 = 0;
     let _ = DwmGetWindowAttribute(
         hwnd,
@@ -103,6 +130,7 @@ unsafe fn describe(hwnd: HWND) -> Option<TopLevelWindow> {
         std::mem::size_of::<u32>() as u32,
     );
     if cloaked != 0 {
+        tracing::trace!(?hwnd, cloaked = %cloaked, "skipped: cloaked window");
         return None;
     }
 
@@ -117,21 +145,51 @@ unsafe fn describe(hwnd: HWND) -> Option<TopLevelWindow> {
         return None;
     }
 
-    // Skip the desktop shell and its worker windows.
+    // Skip the desktop shell and worker windows.
     let class = window_class_name(hwnd);
     if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+        tracing::trace!(?hwnd, class = %class, "skipped: shell class");
         return None;
     }
 
     let title = window_title(hwnd);
     if title.is_empty() {
+        tracing::trace!(?hwnd, class = %class, "skipped: empty title");
         return None;
     }
 
-    let bounds = visible_frame(hwnd)?;
+    // For minimized windows, GetWindowRect returns off-screen coordinates
+    // (-32000, -32000). Anchor the badge at the top-left of the primary
+    // monitor so the user can still see and pick it; `focus()` will
+    // restore the window when chosen.
+    let is_minimized = IsIconic(hwnd).as_bool();
+    let bounds = if is_minimized {
+        Bounds {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 40,
+        }
+    } else {
+        visible_frame(hwnd)?
+    };
+
     if bounds.width <= 0 || bounds.height <= 0 {
+        tracing::trace!(?hwnd, title = %title, "skipped: invalid dimensions");
         return None;
     }
+
+    tracing::trace!(
+        ?hwnd,
+        title = %title,
+        class = %class,
+        x = bounds.x,
+        y = bounds.y,
+        width = bounds.width,
+        height = bounds.height,
+        is_minimized,
+        "window included"
+    );
 
     Some(TopLevelWindow {
         hwnd,
@@ -248,12 +306,17 @@ pub fn pick_with(
 pub fn focus(hwnd: HWND) -> Result<()> {
     unsafe {
         if IsIconic(hwnd).as_bool() {
+            tracing::debug!(?hwnd, "restoring minimized window");
             // ShowWindow returns BOOL = previous-visible state, not an
             // error code; we don't care about the value.
             let _ = ShowWindow(hwnd, SW_RESTORE);
+            // Give the window a moment to restore before trying to focus
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if !SetForegroundWindow(hwnd).as_bool() {
             tracing::warn!(?hwnd, "SetForegroundWindow returned false");
+        } else {
+            tracing::debug!(?hwnd, "window focused successfully");
         }
     }
     Ok(())

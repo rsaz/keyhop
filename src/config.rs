@@ -85,6 +85,19 @@ pub struct BadgeColors {
     pub badge_fg: String,
     /// Border color around both pills.
     pub border: String,
+    /// Per-window opacity for the overlay, expressed as a percentage
+    /// (0..=100). `0` means "use the preset default" so existing config
+    /// files keep their previous behaviour. Values below ~50 quickly
+    /// become unreadable; the settings UI clamps to a sensible range.
+    pub opacity: u8,
+    /// Tri-state override for "draw an arrow from each badge to the
+    /// element it represents". `None` means "use the preset default"
+    /// (on for elements, off for windows) so existing TOML files keep
+    /// their previous look. Set explicitly to override per picker.
+    pub show_leader: Option<bool>,
+    /// Optional pen color for the leader line + arrowhead, as a hex
+    /// `#RRGGBB`. Empty string → use the preset default.
+    pub leader_color: String,
 }
 
 /// Windows startup integration.

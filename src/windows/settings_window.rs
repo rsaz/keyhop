@@ -59,7 +59,7 @@ use crate::hint::DEFAULT_ALPHABET;
 use crate::windows::{hotkey, notification, overlay, startup};
 
 const WINDOW_W: i32 = 520;
-const WINDOW_H: i32 = 500;
+const WINDOW_H: i32 = 640;
 const LABEL_W: i32 = 140;
 const FIELD_X: i32 = 170;
 const FIELD_W: i32 = 320;
@@ -72,6 +72,9 @@ const ID_ALPHABET: usize = 1003;
 const ID_ELEMENT_BG: usize = 1004;
 const ID_WINDOW_BG: usize = 1005;
 const ID_LAUNCH_STARTUP: usize = 1006;
+const ID_ELEMENT_OPACITY: usize = 1007;
+const ID_WINDOW_OPACITY: usize = 1008;
+const ID_SHOW_LEADER: usize = 1009;
 const ID_SAVE: usize = 1100;
 const ID_CANCEL: usize = 1101;
 const ID_RESET: usize = 1102;
@@ -84,7 +87,15 @@ struct State {
     alphabet: HWND,
     element_bg: HWND,
     window_bg: HWND,
+    element_opacity: HWND,
+    window_opacity: HWND,
+    show_leader: HWND,
     launch_startup: HWND,
+    /// Snapshot of the leader-line preference at dialog open. Used to
+    /// decide whether to write `show_leader = Some(...)` or leave it as
+    /// `None` (preset default) — we only persist an explicit override
+    /// when the user actually toggled the checkbox.
+    initial_show_leader: Option<bool>,
     /// Set by the Save handler so [`show`] can return whether the config
     /// was actually written (vs. user cancelled).
     saved: bool,
@@ -213,6 +224,49 @@ unsafe fn build_controls(hwnd: HWND, hinstance: HINSTANCE, initial: &Config) {
     );
     y += ROW_H + PADDING;
 
+    create_section_label(hwnd, hinstance, "Opacity (0-100, 0 = preset default)", y);
+    y += 22;
+
+    create_label(hwnd, hinstance, "Element opacity:", y);
+    let element_opacity = create_edit(
+        hwnd,
+        hinstance,
+        &opacity_or_blank(initial.colors.element.opacity),
+        ID_ELEMENT_OPACITY,
+        y,
+    );
+    y += ROW_H;
+
+    create_label(hwnd, hinstance, "Window opacity:", y);
+    let window_opacity = create_edit(
+        hwnd,
+        hinstance,
+        &opacity_or_blank(initial.colors.window.opacity),
+        ID_WINDOW_OPACITY,
+        y,
+    );
+    y += ROW_H + PADDING;
+
+    // Single source of truth for the leader pref: if either picker has
+    // an explicit value set, surface that (preferring `element` since
+    // that's where the feature is most visible). When both are `None`,
+    // the checkbox starts in its preset-default state (on).
+    let initial_show_leader = initial
+        .colors
+        .element
+        .show_leader
+        .or(initial.colors.window.show_leader);
+    let show_leader_checked = initial_show_leader.unwrap_or(true);
+    let show_leader = create_checkbox(
+        hwnd,
+        hinstance,
+        "Draw arrow from each badge to its target element",
+        show_leader_checked,
+        ID_SHOW_LEADER,
+        y,
+    );
+    y += ROW_H + PADDING;
+
     let startup_now = startup::is_enabled().unwrap_or(initial.startup.launch_at_startup);
     let launch_startup = create_checkbox(
         hwnd,
@@ -250,7 +304,11 @@ unsafe fn build_controls(hwnd: HWND, hinstance: HINSTANCE, initial: &Config) {
         alphabet,
         element_bg,
         window_bg,
+        element_opacity,
+        window_opacity,
+        show_leader,
         launch_startup,
+        initial_show_leader,
         saved: false,
     });
     STATE.with(|s| *s.borrow_mut() = Some(state));
@@ -262,6 +320,31 @@ fn color_or_default(value: &str, default_hex: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Render a 0..=100 opacity value into the edit field. `0` is the
+/// "use preset default" sentinel and is shown as an empty string so
+/// users see a clean field rather than a confusing zero.
+fn opacity_or_blank(value: u8) -> String {
+    if value == 0 {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Parse the opacity edit field back into the 0..=100 representation.
+/// Empty strings (and anything unparseable) become `0` = "preset
+/// default", matching what the placeholder text implies.
+fn parse_opacity(text: &str) -> u8 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    trimmed
+        .parse::<u32>()
+        .map(|v| v.min(100) as u8)
+        .unwrap_or(0)
 }
 
 unsafe fn create_section_label(parent: HWND, hinstance: HINSTANCE, text: &str, y: i32) {
@@ -486,6 +569,22 @@ fn collect_config() -> Option<(Config, bool)> {
         let alphabet = unsafe { read_text(st.alphabet) };
         let element_bg = unsafe { read_text(st.element_bg) };
         let window_bg = unsafe { read_text(st.window_bg) };
+        let element_opacity = parse_opacity(&unsafe { read_text(st.element_opacity) });
+        let window_opacity = parse_opacity(&unsafe { read_text(st.window_opacity) });
+        let show_leader_checked = unsafe {
+            SendMessageW(st.show_leader, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
+                == BST_CHECKED.0 as isize
+        };
+        // Keep the preset default (None) unless the user actually
+        // changed the checkbox from how we showed it. This way upgrade
+        // paths don't suddenly hard-pin everyone to a value, and the
+        // window picker stays leader-less unless the user explicitly
+        // opts in.
+        let show_leader = if Some(show_leader_checked) == st.initial_show_leader {
+            st.initial_show_leader
+        } else {
+            Some(show_leader_checked)
+        };
         let launch_startup = unsafe {
             SendMessageW(st.launch_startup, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
                 == BST_CHECKED.0 as isize
@@ -508,11 +607,17 @@ fn collect_config() -> Option<(Config, bool)> {
                     badge_bg: element_bg,
                     badge_fg: String::new(),
                     border: String::new(),
+                    opacity: element_opacity,
+                    show_leader,
+                    leader_color: String::new(),
                 },
                 window: BadgeColors {
                     badge_bg: window_bg,
                     badge_fg: String::new(),
                     border: String::new(),
+                    opacity: window_opacity,
+                    show_leader,
+                    leader_color: String::new(),
                 },
             },
             startup: StartupConfig {

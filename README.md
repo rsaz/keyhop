@@ -108,6 +108,8 @@ Yellow badges = element picker (will *invoke* the control). Orange badges = wind
 - **Hotkeys** — both leader chords. Type any combination of `Ctrl`, `Shift`, `Alt`, `Win`/`Super` modifiers plus a key (`A`-`Z`, `0`-`9`, `F1`-`F24`, `Space`, arrow keys, punctuation, etc.). Example: `Ctrl+Alt+K`.
 - **Hint alphabet** — the characters used to build hint labels. Default `asdfghjkl` (the home row).
 - **Overlay colors** — element badge background and window badge background, as `#RRGGBB` hex.
+- **Overlay opacity** — per-badge-style translucency from `0` to `100` (where `0` means "use the preset default" and `100` means fully opaque). Lower values let the underlying UI bleed through so you can see what you're about to invoke; the defaults sit around 90% for the element picker and 94% for the window picker.
+- **Target indicator** — when enabled, every element badge paints a thin outline (in the badge's background color) around the actual click target so it's instantly clear which underlying control each card represents — yellow badge, yellow rectangle around the matching element. When smart positioning had to push the badge off the element to dodge a collision, a connector line ending in a small filled triangle is also drawn from the badge to the element. On by default for the element picker; off for the window picker (which already shows a title pill). Toggle per picker via `colors.element.show_leader` / `colors.window.show_leader` in `config.toml`, or via the "Draw arrow from each badge to its target element" checkbox in the Settings dialog.
 - **Launch at Windows startup** — toggles a per-user entry in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (no admin rights required).
 
 `Save` validates everything (invalid hotkey strings or hex colors are rejected up-front), writes `%APPDATA%\keyhop\config.toml`, and shows a confirmation. `Reset to Defaults` deletes the config file. Hotkey, alphabet, and color changes apply on the next launch; the startup toggle takes effect immediately.
@@ -127,14 +129,20 @@ pick_window  = "Ctrl+Alt+Space"
 alphabet = "asdfghjkl"
 
 [colors.element]
-badge_bg = "#FFE500"   # leave empty to keep the default
-badge_fg = ""
-border   = ""
+badge_bg     = "#FFE500"  # leave empty to keep the default
+badge_fg     = ""
+border       = ""
+opacity      = 0          # 0 = preset default; 1..100 = explicit percent
+show_leader  = true       # omit the line entirely to keep the preset default
+leader_color = ""         # hex pen color for the arrow; empty = preset default
 
 [colors.window]
-badge_bg = "#33AAFF"
-badge_fg = ""
-border   = ""
+badge_bg     = "#33AAFF"
+badge_fg     = ""
+border       = ""
+opacity      = 0
+show_leader  = false
+leader_color = ""
 
 [startup]
 launch_at_startup = false
