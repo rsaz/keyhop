@@ -7,19 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **CI: bump `actions/checkout` from v4 to v6.** v4 runs on Node.js 20,
-  which GitHub is forcing to Node.js 24 in June 2026 and removing
-  entirely in September 2026. v6 ships a Node.js 24 runtime and silences
-  the deprecation warning that was surfacing on every CI run.
-- **Refresh `Cargo.lock`** (`winnow` 1.0.1 → 1.0.2). No code change; this
-  is the routine compatible-update sweep so transitive crates stay
-  current.
+## [0.3.0] - 2026-04-22
+
+Browser web-content release. The element picker now actually finds the
+links and buttons *inside* a web page (previously you only got hints on
+browser chrome), the window picker stops listing background UWP ghosts,
+`keyhop` learned to shut itself down from another terminal, and we now
+ship a real **MSI installer** so users no longer need the MSVC toolchain
+to install.
 
 ### Added
+- **MSI installer (`Keyhop-0.3.0-x86_64.msi`)** built via `cargo-wix` /
+  WiX Toolset 3 and attached to every GitHub Release. The installer:
+    - Targets per-machine install (`%ProgramFiles%\Keyhop\bin\`),
+      registers a single Add/Remove Programs entry with proper
+      Publisher / DisplayName / DisplayVersion / UninstallString, plus
+      `ARPHELPLINK`, `ARPURLINFOABOUT`, `ARPURLUPDATEINFO`, and
+      `ARPCONTACT` properties so the Apps & Features panel surfaces
+      links back to GitHub.
+    - Adds `keyhop.exe` to the system `PATH` so `keyhop --close`,
+      `keyhop --clear-logs`, and other one-shot subcommands work from
+      any terminal post-install.
+    - Creates a Start Menu shortcut nested in the binary's MSI
+      Component (advertised; ICE69-clean) so uninstall removes it
+      atomically with the binary.
+    - Supports unattended install via `msiexec /i ... /qn` (silent;
+      satisfies Microsoft Store policy 10.2.9), and uses Windows
+      Installer's RestartManager to cleanly close a running keyhop.exe
+      before an upgrade overwrites it.
+- **`.github/workflows/release.yml`** now builds both the portable
+  `keyhop.exe` *and* the MSI on each published GitHub Release and
+  attaches both as release assets via `softprops/action-gh-release@v3`.
+- **`docs/CODE_SIGNING.md`** documents the path to signing the MSI and
+  EXE via Microsoft Trusted Signing (deferred work — the v0.3.0 binaries
+  ship unsigned, which still passes Store policy 10.2.9 with a
+  recommendation but triggers SmartScreen on first install).
 - **`.github/dependabot.yml`.** Weekly checks for both `cargo` and
-  `github-actions` ecosystems so the `actions/checkout`-style drift
-  doesn't recur and Cargo advisories surface as PRs we can review.
+  `github-actions` ecosystems so action drift doesn't recur and Cargo
+  advisories surface as PRs.
+
+### Changed
+- **CI: bump `actions/checkout` from v4 to v6 and `softprops/action-gh-release` from v2 to v3.** Both v4 / v2 ran on Node.js 20, which GitHub is forcing to Node.js 24 in June 2026 and removing in September 2026. The new versions ship a Node.js 24 runtime and silence the deprecation warning. The bump also fixes the v0.3.0 release upload, which previously failed with `Resource not accessible by integration` because the workflow lacked `permissions: contents: write` — now declared explicitly at the top of `release.yml`.
+- **Refresh `Cargo.lock`** (`winnow` 1.0.1 → 1.0.2).
+- **README install section rewritten** to recommend the MSI as the
+  primary path, position the portable EXE as the alternative, and frame
+  `cargo install keyhop` as the developer path (with an explicit note
+  about the `link.exe not found` failure mode that surfaced for users
+  without Visual Studio Build Tools installed).
 
 ### Security
 - **Dismiss GHSA-wrw7-89jp-8q8g (`glib < 0.20.0` `VariantStrIter`
@@ -36,14 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required before the lockfile can drop the warning, hence the
   dismissal rather than a `cargo update` fix.
 
-## [0.3.0] - 2026-04-22
-
-Browser web-content release. The element picker now actually finds the
-links and buttons *inside* a web page (previously you only got hints on
-browser chrome), the window picker stops listing background UWP ghosts,
-and `keyhop` learned to shut itself down from another terminal.
-
-### Added
+### Added (browser + lifecycle work that originally shipped this version)
 - **Browser webpage content detection.** `Ctrl+Shift+Space` on a
   Chromium-based browser (Chrome, Edge, Brave, Opera, Vivaldi, Arc) now
   hints the actual page content — links, buttons, file rows, nav tabs,
@@ -74,7 +101,7 @@ and `keyhop` learned to shut itself down from another terminal.
   reached, and whether the walk hit the depth or element cap. Triages
   "didn't see X on page Y" reports without a Spy++ session.
 
-### Changed
+### Changed (browser + lifecycle)
 - **Element-picker badges are smaller and float above the target.**
   Font height dropped from 20px to 16px and horizontal padding from 6px
   to 5px, and the layout pass now tries `OutsideTop` first (then

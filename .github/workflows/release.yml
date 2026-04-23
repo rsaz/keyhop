@@ -4,13 +4,19 @@ on:
   release:
     types: [published]
 
+# The default GITHUB_TOKEN is contents:read in many repos. softprops/action-gh-release
+# needs contents:write to attach assets to the release. Without this we get
+# "Resource not accessible by integration" at upload time.
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
   build-windows:
-    name: Build and attach binary to release
+    name: Build and attach Windows artifacts to release
     runs-on: windows-latest
 
     steps:
@@ -23,12 +29,44 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # cargo-wix is a thin wrapper around WiX Toolset 3 (preinstalled
+      # on windows-latest at C:\Program Files (x86)\WiX Toolset v3.*\bin
+      # and on PATH). It builds an MSI from wix/main.wxs.
+      - name: Install cargo-wix
+        run: cargo install --locked cargo-wix --version "^0.3"
+
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Attach binary to GitHub Release
-        uses: softprops/action-gh-release@v2
+      # Build the MSI installer. --no-build skips the redundant
+      # cargo build (we just did it) and reuses target/release/keyhop.exe.
+      # Output: target/wix/Keyhop-<version>-x86_64.msi
+      - name: Build MSI installer
+        run: cargo wix --no-build --nocapture
+
+      # Surface the produced asset paths into env vars so the upload
+      # step doesn't have to glob them. cargo-wix's output filename
+      # encodes the package version, so this also acts as a sanity
+      # check that Cargo.toml and the release tag agree.
+      - name: Locate artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path target/wix -Filter "Keyhop-*-x86_64.msi" | Select-Object -First 1
+          if (-not $msi) { throw "No MSI produced under target/wix" }
+          $exe = "target/release/keyhop.exe"
+          if (-not (Test-Path $exe)) { throw "No keyhop.exe at $exe" }
+          "msi=$($msi.FullName)" >> $env:GITHUB_OUTPUT
+          "exe=$exe"             >> $env:GITHUB_OUTPUT
+          Write-Host "MSI: $($msi.FullName) ($([math]::Round($msi.Length/1MB,2)) MB)"
+          Write-Host "EXE: $exe"
+
+      - name: Attach binaries to GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          files: target/release/keyhop.exe
+          files: |
+            ${{ steps.artifacts.outputs.exe }}
+            ${{ steps.artifacts.outputs.msi }}
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -46,15 +46,35 @@ One package, one publish: `keyhop` ships both the binary and a reusable library 
 
 ## Install
 
-From crates.io (recommended once published):
+### Windows (recommended) — MSI installer
+
+Grab `Keyhop-<version>-x86_64.msi` from the [latest GitHub Release](https://github.com/rsaz/keyhop/releases/latest) and double-click it. The installer:
+
+- Installs to `%ProgramFiles%\Keyhop\bin\keyhop.exe`
+- Adds Keyhop to the **system PATH** so `keyhop --close`, `keyhop --clear-logs`, etc. work from any terminal
+- Creates a **Start Menu** shortcut
+- Registers a single **Add/Remove Programs** entry (uninstall via `appwiz.cpl` or `Settings → Apps`)
+- Cleanly closes a running instance during upgrades (Windows Installer's RestartManager)
+
+For unattended installs (CI, fleet rollout, MDM, Microsoft Store automated validation):
 
 ```powershell
-cargo install keyhop
+msiexec /i Keyhop-0.3.0-x86_64.msi /qn
 ```
 
-From source:
+UAC will prompt once for admin rights (per-machine install).
+
+### Windows — portable EXE
+
+If you don't want an installer, download `keyhop.exe` from the same [release page](https://github.com/rsaz/keyhop/releases/latest), drop it anywhere, and run it. No registry footprint, no Start Menu entry — you're on your own for placing it on PATH and for upgrades.
+
+### Build from source (developers)
+
+You'll need the MSVC toolchain (the regular Rust install on Windows pulls this in for you):
 
 ```powershell
+cargo install keyhop                    # from crates.io
+# — or —
 git clone https://github.com/rsaz/keyhop
 cd keyhop
 cargo install --path .
@@ -62,7 +82,9 @@ cargo install --path .
 
 Requires:
 - Rust stable with the `x86_64-pc-windows-msvc` toolchain
-- Visual Studio Build Tools with the "Desktop development with C++" workload
+- Visual Studio Build Tools with the "Desktop development with C++" workload (provides `link.exe`)
+
+If you see `error: linker 'link.exe' not found`, install the Build Tools — or just use the MSI installer above, which has no toolchain requirement.
 
 ## Run
 

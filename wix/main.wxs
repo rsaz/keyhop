@@ -1,0 +1,200 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX installer source for keyhop. Built by cargo-wix:
+      cargo wix
+  See <https://github.com/volks73/cargo-wix>.
+
+  Customizations vs. the cargo-wix init template:
+    * Display name "Keyhop" (capitalized) for ARP / Start Menu UX.
+    * Per-machine install (single Add/Remove Programs entry; UAC prompt
+      is permitted by Microsoft Store policy 10.2.9).
+    * Single MSI Component for the binary, plus separate Components for
+      the license sidecar, the Start Menu shortcut, and the PATH entry.
+    * Full ARP metadata (DisplayName / Publisher / Version /
+      UninstallString are added automatically by Windows Installer; we
+      add ARPURLINFOABOUT / ARPHELPLINK / ARPURLUPDATEINFO /
+      ARPNOMODIFY / ARPNOREPAIR so users get Help link + "About" link
+      and the entry is non-modifiable).
+    * RestartManager is on by default in Windows Installer; combined
+      with `MajorUpgrade` it cleanly closes a running keyhop.exe
+      before the upgrade overwrites it.
+    * No EULA dialog. Microsoft Store only checks `msiexec /qn`
+      silent install, which works regardless of UI; an EULA would
+      block users who double-click. The MIT license is still
+      installed alongside the binary as a sidecar.
+-->
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='Keyhop'
+        UpgradeCode='49555F40-7E07-468A-8307-AE8FCEEB63DA'
+        Manufacturer='Richard Zampieri'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Keyhop $(var.Version) installer'
+            Comments='System-wide keyboard navigation overlay. Drive your desktop without the mouse.'
+            Manufacturer='Richard Zampieri'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <!--
+          Cleanly close a running keyhop.exe via Windows Installer's
+          RestartManager before the upgrade overwrites the file. Without
+          this an upgrade would fail with "files in use" if keyhop is
+          running from the tray.
+        -->
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='Keyhop Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='Keyhop'>
+
+                    <Component Id='License' Guid='*'>
+                        <File
+                            Id='LicenseFile'
+                            Name='LICENSE.txt'
+                            DiskId='1'
+                            Source='LICENSE-MIT'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='B7BFAB6F-3C97-4B88-A4EE-0F292CD0D018' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+                        <!--
+                          The Start Menu shortcut is nested inside the
+                          binary's <File> as an advertised shortcut. This
+                          puts the shortcut and its target file in the
+                          same MSI Component, which is what ICE69 wants
+                          and means uninstall removes both together.
+                        -->
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='keyhop.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\keyhop.exe'
+                                KeyPath='yes'>
+                                <Shortcut
+                                    Id='KeyhopStartMenuShortcut'
+                                    Directory='ApplicationProgramsFolder'
+                                    Name='Keyhop'
+                                    Description='System-wide keyboard navigation overlay'
+                                    WorkingDirectory='APPLICATIONFOLDER'
+                                    Advertise='yes'/>
+                            </File>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+
+            <!--
+              The Start Menu folder must be declared so the advertised
+              shortcut above has somewhere to live. The
+              <ApplicationFolderCleanup> Component owns the folder
+              removal at uninstall time, with an HKCU RegistryValue as
+              the per-user KeyPath that ICE69 requires.
+            -->
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='Keyhop'>
+                    <Component Id='ApplicationFolderCleanup' Guid='*'>
+                        <RemoveFolder Id='RemoveApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue
+                            Root='HKCU'
+                            Key='Software\Keyhop'
+                            Name='installed'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs keyhop.exe, the LICENSE file, and a Start Menu shortcut.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='ApplicationFolderCleanup'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Adds the install location to the system PATH so `keyhop` can be invoked from any terminal (including `keyhop --close`).'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <!--
+          Add/Remove Programs metadata. DisplayName, Publisher,
+          DisplayVersion, and UninstallString are populated by Windows
+          Installer from <Product> + <Package> attributes above; the
+          properties below add the optional links and disable the
+          Modify/Repair buttons (we ship no per-feature toggles users
+          would meaningfully want to flip post-install).
+        -->
+        <Property Id='ARPHELPLINK' Value='https://github.com/rsaz/keyhop'/>
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/rsaz/keyhop'/>
+        <Property Id='ARPURLUPDATEINFO' Value='https://github.com/rsaz/keyhop/releases'/>
+        <Property Id='ARPCONTACT' Value='Richard Zampieri'/>
+        <Property Id='ARPNOMODIFY' Value='1'/>
+        <Property Id='ARPNOREPAIR' Value='1'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+
+            <!--
+              Skip the customization dialog by default for the
+              double-click install path. Silent install (`msiexec /qn`)
+              already bypasses the entire UI sequence, so this only
+              affects the interactive flow.
+            -->
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+
+        </UI>
+
+    </Product>
+
+</Wix>

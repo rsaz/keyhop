@@ -57,3 +57,19 @@ opt-level = 3
 default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+# cargo-wix configuration for the MSI installer. `cargo wix` builds
+# an MSI from `wix/main.wxs` and writes it to `target/wix/`. The
+# generated package supports silent install (`msiexec /i ... /qn`),
+# registers a single Add/Remove Programs entry, and adds a Start Menu
+# shortcut + PATH entry. See `docs/CODE_SIGNING.md` for the signing
+# step that runs after `cargo wix` in release builds.
+[package.metadata.wix]
+name = "Keyhop"
+manufacturer = "Richard Zampieri"
+# Skip the EULA dialog: Microsoft Store policy 10.2.9 only validates
+# `msiexec /qn` (silent), and an EULA would only ever block users who
+# *do* see the UI. The MIT license still ships as a sidecar file.
+eula = false
+# `cargo wix init` already generated wix/main.wxs; don't regenerate.
+no-build = false
