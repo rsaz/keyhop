@@ -8,3 +8,91 @@ release = "cargo build --release"
 install = "cargo install --path . --locked --force"
 test = { command = "cargo test", env = { RUST_LOG = "warn" } }
 doc = "cargo doc --no-deps --open"
+
+# ---------------------------------------------------------------------------
+# Windows installer (MSI) — produces target/wix/Keyhop-<version>-x86_64.msi
+#
+# `cargo wix` shells out to candle.exe / light.exe from the WiX Toolset 3.
+# Those binaries are *not* on PATH on a default Windows install. The
+# wrapper below probes the well-known locations (the WIX env var that
+# the WiX MSI sets, scoop, and Program Files) and prepends the first
+# match to PATH for the duration of the script.
+#
+# Prerequisites once per machine:
+#   scoop install wixtoolset3
+#   cargo install --locked cargo-wix --version "^0.3"
+#
+# Usage:
+#   cargo script msi          # full build: release exe + MSI
+#   cargo script msi-only     # just the MSI (assumes target/release/keyhop.exe exists)
+#   cargo script msi-clean    # wipe target/wix
+#   cargo script msi-show     # print the produced MSI's path + size
+# ---------------------------------------------------------------------------
+
+[scripts.msi]
+interpreter = "powershell"
+info = "Build keyhop.exe + Windows MSI installer for distribution"
+command = """
+$ErrorActionPreference = 'Stop'
+if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+    $candidates = @(
+        "$env:WIX\\bin",
+        "$env:USERPROFILE\\scoop\\apps\\wixtoolset3\\current",
+        "${env:ProgramFiles(x86)}\\WiX Toolset v3.14\\bin",
+        "${env:ProgramFiles(x86)}\\WiX Toolset v3.11\\bin"
+    )
+    $wix = $candidates | Where-Object { $_ -and (Test-Path "$_\\candle.exe") } | Select-Object -First 1
+    if (-not $wix) {
+        throw "WiX Toolset 3 not found. Install with: scoop install wixtoolset3"
+    }
+    $env:PATH = "$wix;$env:PATH"
+}
+cargo build --release --locked
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+cargo wix --no-build --nocapture
+if ($LASTEXITCODE -ne 0) { throw "cargo wix failed" }
+$msi = Get-ChildItem -Path target/wix -Filter "Keyhop-*-x86_64.msi" | Select-Object -First 1
+if ($msi) {
+    Write-Host ""
+    Write-Host "MSI: $($msi.FullName) ($([math]::Round($msi.Length / 1MB, 2)) MB)"
+}
+"""
+
+[scripts.msi-only]
+interpreter = "powershell"
+info = "Build only the MSI (assumes target/release/keyhop.exe is up to date)"
+command = """
+$ErrorActionPreference = 'Stop'
+if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+    $candidates = @(
+        "$env:WIX\\bin",
+        "$env:USERPROFILE\\scoop\\apps\\wixtoolset3\\current",
+        "${env:ProgramFiles(x86)}\\WiX Toolset v3.14\\bin",
+        "${env:ProgramFiles(x86)}\\WiX Toolset v3.11\\bin"
+    )
+    $wix = $candidates | Where-Object { $_ -and (Test-Path "$_\\candle.exe") } | Select-Object -First 1
+    if (-not $wix) {
+        throw "WiX Toolset 3 not found. Install with: scoop install wixtoolset3"
+    }
+    $env:PATH = "$wix;$env:PATH"
+}
+if (-not (Test-Path "target/release/keyhop.exe")) {
+    throw "target/release/keyhop.exe not found. Run 'cargo script release' first, or use 'cargo script msi'."
+}
+cargo wix --no-build --nocapture
+"""
+
+[scripts.msi-clean]
+interpreter = "powershell"
+info = "Remove target/wix so the next msi build starts clean"
+command = "if (Test-Path target/wix) { Remove-Item -Recurse -Force target/wix; Write-Host 'Removed target/wix' } else { Write-Host 'target/wix already clean' }"
+
+[scripts.msi-show]
+interpreter = "powershell"
+info = "List the MSI(s) under target/wix"
+command = """
+if (-not (Test-Path target/wix)) { Write-Host 'No target/wix yet. Run: cargo script msi'; exit 0 }
+Get-ChildItem -Path target/wix -Filter "*.msi" | ForEach-Object {
+    "{0,-40} {1,8:N2} MB   {2}" -f $_.Name, ($_.Length / 1MB), $_.LastWriteTime
+}
+"""
