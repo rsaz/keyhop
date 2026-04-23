@@ -43,7 +43,8 @@ keyhop/
 ├─ wix/
 │  └─ main.wxs             # WiX 3 source for the MSI installer
 ├─ docs/
-│  └─ CODE_SIGNING.md      # Microsoft Trusted Signing setup (deferred)
+│  ├─ CODE_SIGNING.md      # Microsoft Trusted Signing setup (deferred)
+│  └─ MICROSOFT_STORE.md   # Partner Center submission runbook (silent install switch, ARP, hosting)
 └─ examples/
    └─ enumerate_foreground.rs
 ```

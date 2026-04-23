@@ -132,6 +132,84 @@ Get-ChildItem -Path target/wix -Filter "*.msi" | ForEach-Object {
 #   cargo script get_url --env URL=https://github.com/rsaz/keyhop/releases/download/v0.3.0/keyhop.exe
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# verify-r2 — confirm the MSI mirrored to Cloudflare R2 matches GitHub Releases
+#
+# We publish the same MSI bytes through two channels: GitHub Releases (the
+# source of truth, written by `release.yml`) and Cloudflare R2 (the URL
+# pasted into Microsoft Partner Center, currently uploaded by hand). This
+# script downloads the MSI from both URLs and SHA256-compares them.
+#
+# A mismatch means one of two things:
+#   1. The R2 upload was corrupted or partial — re-upload via the
+#      Cloudflare dashboard at:
+#        keyhop / release / v<version> /
+#      (see RELEASE_PROCESS.md § 2 for the click-by-click).
+#   2. Someone uploaded the wrong file to R2 (e.g. an older version).
+#      Same fix.
+#
+# Runs without any credentials — both URLs are public.
+#
+# Usage:
+#   cargo script verify-r2 --env VERSION=0.3.0
+#
+# Optional overrides (defaults match keyhop's current setup):
+#   --env GH_OWNER=rsaz       (GitHub repo owner)
+#   --env GH_REPO=keyhop      (GitHub repo name)
+#   --env R2_BASE=https://dl.expresso-ts.com/release   (R2 public base URL)
+# ---------------------------------------------------------------------------
+
+[scripts.verify-r2]
+interpreter = "powershell"
+info = "Compare the SHA256 of the MSI on GitHub Releases vs Cloudflare R2 (--env VERSION=0.3.0)"
+command = """
+$ErrorActionPreference = 'Stop'
+$version = $env:VERSION
+if (-not $version) {
+    Write-Host "Usage: cargo script verify-r2 --env VERSION=<x.y.z>"
+    Write-Host "Example: cargo script verify-r2 --env VERSION=0.3.0"
+    exit 0
+}
+$ghOwner = if ($env:GH_OWNER) { $env:GH_OWNER } else { 'rsaz' }
+$ghRepo  = if ($env:GH_REPO)  { $env:GH_REPO }  else { 'keyhop' }
+$r2Base  = if ($env:R2_BASE)  { $env:R2_BASE }  else { 'https://dl.expresso-ts.com/release' }
+$file    = "Keyhop-$version-x86_64.msi"
+$ghUrl   = "https://github.com/$ghOwner/$ghRepo/releases/download/v$version/$file"
+$r2Url   = "$r2Base/v$version/$file"
+$ghTmp   = Join-Path $env:TEMP "verify-r2-gh.msi"
+$r2Tmp   = Join-Path $env:TEMP "verify-r2-r2.msi"
+Write-Host "GitHub: $ghUrl"
+Write-Host "R2    : $r2Url"
+Write-Host ""
+Write-Host "--- downloading both ---"
+curl.exe -sL --fail -o $ghTmp $ghUrl
+if ($LASTEXITCODE -ne 0) { throw "GitHub download failed (exit $LASTEXITCODE). Is v$version published?" }
+curl.exe -sL --fail -o $r2Tmp $r2Url
+if ($LASTEXITCODE -ne 0) { throw "R2 download failed (exit $LASTEXITCODE). Did you upload the MSI to release/v$version/ ?" }
+function Get-Sha256Hex([string]$path) {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToUpper() }
+    finally { $sha.Dispose() }
+}
+$ghHash = Get-Sha256Hex $ghTmp
+$r2Hash = Get-Sha256Hex $r2Tmp
+$ghSize = (Get-Item $ghTmp).Length
+$r2Size = (Get-Item $r2Tmp).Length
+Write-Host ""
+Write-Host "--- comparison ---"
+Write-Host ("GitHub: {0}  ({1:N0} bytes)" -f $ghHash, $ghSize)
+Write-Host ("R2    : {0}  ({1:N0} bytes)" -f $r2Hash, $r2Size)
+Write-Host ""
+if ($ghHash -eq $r2Hash) {
+    Write-Host "Match : OK -- safe to submit $r2Url to Partner Center." -ForegroundColor Green
+    exit 0
+} else {
+    Write-Host "Match : MISMATCH -- DO NOT submit. Re-upload the MSI to R2 (see RELEASE_PROCESS.md section 2)." -ForegroundColor Red
+    exit 1
+}
+"""
+
 [scripts.get_url]
 interpreter = "powershell"
 info = "Resolve a github.com release-asset URL to its current signed download URL (--env URL=...)"
