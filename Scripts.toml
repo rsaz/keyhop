@@ -96,3 +96,68 @@ Get-ChildItem -Path target/wix -Filter "*.msi" | ForEach-Object {
     "{0,-40} {1,8:N2} MB   {2}" -f $_.Name, ($_.Length / 1MB), $_.LastWriteTime
 }
 """
+
+# ---------------------------------------------------------------------------
+# get_url — resolve a stable github.com asset URL to its current signed URL
+#
+# Takes a permanent GitHub release-asset URL of the form
+#   https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
+# and prints the *current* signed `release-assets.githubusercontent.com/...`
+# URL that GitHub 302-redirects to. The signed URL is short-lived (~5 min)
+# and is what GitHub serves the bytes from, so it's mostly useful for:
+#   - pasting into forms that pre-resolve the redirect (Microsoft Partner
+#     Center's Package URL field shows this expanded form)
+#   - debugging download failures (you can inspect the SAS expiry)
+#   - sanity-checking that an asset actually exists before publishing
+#
+# DO NOT submit the resolved URL anywhere that needs to keep working
+# longer than ~5 minutes — the signature expires. Submit the original
+# `github.com/.../releases/download/...` URL for any long-lived
+# integration (Store submissions, README badges, package manifests).
+#
+# `cargo script` doesn't forward positional args after the script name —
+# only env vars via `--env KEY=VALUE`. We read the URL from `$env:URL`,
+# with `$env:KEYHOP_RELEASE_URL` as a fallback for the common case of
+# resolving the latest keyhop MSI.
+#
+# Uses `curl.exe` (not PowerShell's `curl` alias for Invoke-WebRequest)
+# so the `-sI` head-only request actually returns the redirect headers.
+# Windows 10 1803+ and Windows 11 ship curl.exe by default.
+#
+# Usage:
+#   cargo script get_url --env URL=<github-release-asset-url>
+#
+# Examples:
+#   cargo script get_url --env URL=https://github.com/rsaz/keyhop/releases/download/v0.3.0/Keyhop-0.3.0-x86_64.msi
+#   cargo script get_url --env URL=https://github.com/rsaz/keyhop/releases/download/v0.3.0/keyhop.exe
+# ---------------------------------------------------------------------------
+
+[scripts.get_url]
+interpreter = "powershell"
+info = "Resolve a github.com release-asset URL to its current signed download URL (--env URL=...)"
+command = """
+$ErrorActionPreference = 'Stop'
+$url = if ($env:URL) { $env:URL } elseif ($env:KEYHOP_RELEASE_URL) { $env:KEYHOP_RELEASE_URL } else { $null }
+if (-not $url) {
+    # Exit 0 (not 1) so cargo-script doesn't suppress stdout — it
+    # currently hides script Write-Host output on non-zero exits and
+    # prints the script body instead, which makes a "missing arg" diag
+    # look like a syntax error.
+    Write-Host "Usage: cargo script get_url --env URL=<github-release-asset-url>"
+    Write-Host ""
+    Write-Host "Example:"
+    Write-Host "  cargo script get_url --env URL=https://github.com/rsaz/keyhop/releases/download/v0.3.0/Keyhop-0.3.0-x86_64.msi"
+    exit 0
+}
+if ($url -notmatch '^https?://') {
+    throw "Not a URL: '$url'"
+}
+$location = curl.exe -sI $url |
+    Select-String -Pattern '^location:' |
+    ForEach-Object { ($_ -split ' ', 2)[1].Trim() } |
+    Select-Object -Last 1
+if (-not $location) {
+    throw "No 'location:' header in response from $url - not a redirecting asset URL, or the asset doesn't exist."
+}
+Write-Host $location
+"""
