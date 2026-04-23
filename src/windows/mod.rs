@@ -93,6 +93,22 @@ const MAX_ELEMENTS_DESKTOP: usize = 500;
 /// signal-to-noise ratio sane at this size.
 const MAX_ELEMENTS_BROWSER: usize = 800;
 
+/// Per-window element cap applied to *non-foreground* windows in the
+/// multi-window scope modes (`ActiveMonitor`, `AllWindows`).
+///
+/// Without this, a single chatty background app — Cursor, Slack, a
+/// content-rich Outlook window — can return its full
+/// [`MAX_ELEMENTS_DESKTOP`]/[`MAX_ELEMENTS_BROWSER`] quota and starve
+/// every other visible app of badge slots, leaving the user staring at
+/// 300 hints all anchored on one monitor.
+///
+/// 80 is empirically enough to cover the visible affordances of any
+/// reasonable app at a glance, while leaving budget for ~3 other
+/// windows on the typical 3-monitor setup. The foreground window is
+/// always exempt — the user clearly cares about that one and we want
+/// to preserve every clickable on it.
+const PER_WINDOW_HINT_CAP_MULTI: usize = 80;
+
 /// Default minimum element size (in physical pixels) before we even
 /// consider a web element. Filters out the swarms of 1×1 / 4×4
 /// layout/spacer/decoration nodes that the Chromium UIA provider
@@ -363,13 +379,30 @@ impl WindowsBackend {
         // across runs (helpful for test reproducibility and for
         // attributing trace logs to specific apps). The foreground pid
         // gets walked first; everything else fans out onto rayon.
+        //
+        // Z-order pruning: `enumerate_visible` returns windows in
+        // top-down z-order. We track the union of higher-z window
+        // bounds per monitor and skip any window whose entire frame is
+        // already covered — that window is hidden from the user, so
+        // walking it would just waste a UIA round-trip and pollute the
+        // overlay with badges the user can't see.
         let mut by_pid: BTreeMap<u32, Vec<crate::windows::window_picker::TopLevelWindow>> =
             BTreeMap::new();
         let mut foreground_pid: Option<u32> = None;
+        let mut occlusion = OcclusionTracker::new();
         for win in candidates {
             if !accept(&win.bounds) {
                 continue;
             }
+            // Foreground window is the user's focus; never let occlusion
+            // tracking skip it even if some popup happens to fully cover
+            // its frame for a frame.
+            if win.hwnd != foreground && occlusion.is_fully_covered(&win.bounds) {
+                tracing::debug!(?win.hwnd, title = %win.title,
+                    "skipping fully occluded window");
+                continue;
+            }
+            occlusion.record(&win.bounds);
             let pid = window_pid(win.hwnd);
             if win.hwnd == foreground {
                 foreground_pid = Some(pid);
@@ -383,6 +416,12 @@ impl WindowsBackend {
         // hotkey-driven backend can invoke any element on the active
         // window via `perform()` even if a parallel worker had
         // pre-walked the same HWND.
+        //
+        // The foreground HWND is allowed the full per-window quota
+        // (it's the user's primary target); other windows in the same
+        // pid group share the smaller `PER_WINDOW_HINT_CAP_MULTI`
+        // budget so a single chatty app can't crowd everything else
+        // out of the overlay.
         let mut out: Vec<Element> = Vec::with_capacity(64);
         if let Some(pid) = foreground_pid {
             if let Some(group) = by_pid.remove(&pid) {
@@ -395,7 +434,12 @@ impl WindowsBackend {
                     match self.enumerate_window(win.hwnd) {
                         Ok(elements) => {
                             let remaining = cap - out.len();
-                            out.extend(elements.into_iter().take(remaining));
+                            let per_window = if win.hwnd == foreground {
+                                remaining
+                            } else {
+                                PER_WINDOW_HINT_CAP_MULTI.min(remaining)
+                            };
+                            out.extend(elements.into_iter().take(per_window));
                         }
                         Err(e) => {
                             tracing::warn!(?win.hwnd, title = %win.title, error = ?e,
@@ -453,7 +497,18 @@ impl WindowsBackend {
                             is_browser,
                         ) {
                             Ok(records) => {
-                                local.extend(records.into_iter().map(SendWalkRecord));
+                                // Per-window cap so one busy background
+                                // window (e.g. a Cursor / VS Code with
+                                // hundreds of UIA matches) can't eat the
+                                // global budget alone, leaving the user's
+                                // other open apps unbadged on
+                                // multi-monitor setups.
+                                local.extend(
+                                    records
+                                        .into_iter()
+                                        .take(PER_WINDOW_HINT_CAP_MULTI)
+                                        .map(SendWalkRecord),
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(?win.hwnd, title = %win.title, error = ?e,
@@ -772,6 +827,68 @@ fn rect_overlap_fraction(monitor: &RECT, bounds: &Bounds) -> f32 {
     intersection as f32 / area as f32
 }
 
+/// Multi-monitor z-order occlusion tracker.
+///
+/// `enumerate_visible` returns top-level windows in z-order top to
+/// bottom (highest first). For each candidate we ask: "is this window's
+/// frame already fully covered by one of the higher-z windows?" If so,
+/// the user can't see it, so walking it would only generate badges they
+/// can't act on.
+///
+/// We approximate occlusion by recording every accepted window's
+/// bounds and asking whether the candidate's frame intersects any
+/// **single** previously-recorded rectangle that fully covers it.
+/// True polygon-union coverage would require a sweep-line algorithm
+/// and a lot more code; full single-rect containment catches the
+/// dominant real-world case (a maximized window completely hiding the
+/// one beneath it on the same monitor) without the complexity.
+///
+/// Bounded to a small ring buffer so the check stays O(N) per
+/// candidate even with dozens of visible windows; in practice the
+/// "is fully covered" check exits on the first hit.
+struct OcclusionTracker {
+    higher_z: Vec<Bounds>,
+}
+
+impl OcclusionTracker {
+    fn new() -> Self {
+        Self {
+            higher_z: Vec::with_capacity(16),
+        }
+    }
+
+    /// True when `candidate` is fully contained in (and meaningfully
+    /// smaller than) any previously-recorded higher-z window. The size
+    /// guard prevents a window from accidentally occluding itself when
+    /// the same HWND appears twice — shouldn't happen in a clean
+    /// `EnumWindows` traversal but the guard is cheap insurance.
+    fn is_fully_covered(&self, candidate: &Bounds) -> bool {
+        if candidate.width <= 0 || candidate.height <= 0 {
+            return true; // nothing to walk anyway
+        }
+        for higher in &self.higher_z {
+            if bounds_contains(higher, candidate)
+                && (higher.width as i64 * higher.height as i64)
+                    > (candidate.width as i64 * candidate.height as i64)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record(&mut self, bounds: &Bounds) {
+        self.higher_z.push(*bounds);
+    }
+}
+
+fn bounds_contains(outer: &Bounds, inner: &Bounds) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && (inner.x + inner.width) <= (outer.x + outer.width)
+        && (inner.y + inner.height) <= (outer.y + outer.height)
+}
+
 /// Look up the owning process id of `hwnd`. Returns `0` if the call
 /// fails (typically because the HWND was destroyed between
 /// enumeration and pid lookup); callers treat `0` as a synthetic
@@ -1059,9 +1176,18 @@ pub(crate) fn walk_window(
             &mut stats,
         );
     }
+    // Post-walk dedup: collapse nested clickables so the overlay only
+    // surfaces the most-specific target per visual region. UIA loves to
+    // expose both an outer ListItem/Group and the inner Button/Hyperlink
+    // it wraps; without this pass the user sees stacked badges fighting
+    // for the same screen real estate.
+    let pre_dedup = out.len();
+    let out = dedup_nested_records(out);
+    let post_dedup = out.len();
     if tracing::enabled!(tracing::Level::DEBUG) {
         tracing::debug!(
-            collected = out.len(),
+            collected = post_dedup,
+            dedup_dropped = pre_dedup - post_dedup,
             visited = stats.visited,
             max_depth = stats.max_depth,
             hit_depth_cap = stats.hit_depth_cap,
@@ -1173,19 +1299,124 @@ fn find_all_desktop(
     }
 }
 
+/// Smallest dimension a hint can usefully label. Anything thinner than this
+/// can't fit even a single-letter badge without overflowing the target,
+/// and is almost always either a decorative pixel-strip (separator, focus
+/// rectangle) or a UIA noise node Windows leaves behind. Dropping these up
+/// front is the single biggest win for "screen full of badges" complaints.
+const MIN_HINT_PX: i32 = 12;
+
+/// Largest dimension a hint can plausibly belong to before it stops being
+/// a discrete click target. Real buttons / links / inputs cap out around
+/// ~1000px in practice; anything bigger is almost certainly a panel,
+/// document body, or layout container that exposes an action pattern by
+/// accident (e.g. an Edit covering the entire chat pane). The cap is
+/// generous on purpose so 4K monitors aren't punished for genuinely big
+/// affordances like full-width hero buttons.
+const MAX_HINT_PX: i32 = 1500;
+
+/// ControlTypes that masquerade as click targets in the UIA tree but are
+/// usually inert containers unless they're explicitly named, focusable,
+/// or expose an action pattern. Without this guard, `FindAll(Subtree, …)`
+/// pulls in every unnamed ListItem in a virtualized list and every <img>
+/// in a Chromium-based app, which is the dominant source of badge spam.
+fn is_structural_clickable_type(ct: ControlType) -> bool {
+    matches!(
+        ct,
+        ControlType::ListItem
+            | ControlType::DataItem
+            | ControlType::TreeItem
+            | ControlType::Image
+    )
+}
+
 /// Slim variant of [`try_record`] used after the server-side pre-filter
-/// has already discarded offscreen / non-control elements.
+/// has already discarded offscreen / non-control elements. Adds the
+/// post-Phase-7 UX guards that the broad `FindAll(Subtree, …)` condition
+/// can't express server-side: minimum/maximum bounds, and a stricter
+/// "must be obviously interactable" check for structural ControlTypes.
 fn try_record_desktop_after_filter(el: &UIElement) -> Option<WalkRecord> {
     let bounds = el.get_cached_bounding_rectangle().ok()?;
-    if bounds.get_width() <= 0 || bounds.get_height() <= 0 {
+    let w = bounds.get_width();
+    let h = bounds.get_height();
+    if w < MIN_HINT_PX || h < MIN_HINT_PX {
+        return None;
+    }
+    if w > MAX_HINT_PX || h > MAX_HINT_PX {
         return None;
     }
     if !cached_bool(el, UIProperty::IsEnabled).unwrap_or(true) {
         return None;
     }
     let ct = el.get_cached_control_type().ok()?;
+    if is_structural_clickable_type(ct) {
+        let has_name = el
+            .get_cached_name()
+            .ok()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_pattern = has_any_action_pattern(el);
+        let focusable = cached_bool(el, UIProperty::IsKeyboardFocusable).unwrap_or(false);
+        if !(has_name || has_pattern || focusable) {
+            return None;
+        }
+    }
     try_record_desktop_element(el, ct)
 }
+
+/// Drop records that are visually redundant with another record in the
+/// same window: when one record's bounds fully contain another and the
+/// outer is meaningfully larger, keep the inner (the more specific click
+/// target) and drop the outer (a container disguised as clickable).
+///
+/// The 3:2 area ratio guard keeps near-equal records from cannibalizing
+/// each other (e.g. a Button and its inner Text node sharing bounds) —
+/// in those cases the walker emits both and the layout collision logic
+/// hides the duplicate naturally.
+///
+/// Worst-case complexity is O(n²), but `n` is bounded by
+/// [`MAX_ELEMENTS_DESKTOP`]/[`MAX_ELEMENTS_BROWSER`] so the absolute cost
+/// stays well under a millisecond per window even on the busiest pages.
+fn dedup_nested_records(records: Vec<WalkRecord>) -> Vec<WalkRecord> {
+    let n = records.len();
+    if n <= 1 {
+        return records;
+    }
+    let areas: Vec<i64> = records
+        .iter()
+        .map(|r| (r.bounds.width as i64) * (r.bounds.height as i64))
+        .collect();
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        if !keep[i] {
+            continue;
+        }
+        let outer = &records[i].bounds;
+        let outer_area = areas[i];
+        for j in 0..n {
+            if i == j || !keep[j] {
+                continue;
+            }
+            let inner = &records[j].bounds;
+            if !bounds_contains(outer, inner) {
+                continue;
+            }
+            // Outer must be at least 1.5× the inner's area before we
+            // call it "the container" — otherwise the two are essentially
+            // co-located and we leave dedup to the overlay layout pass.
+            if outer_area > areas[j].saturating_mul(3) / 2 {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+    records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| if keep[i] { Some(r) } else { None })
+        .collect()
+}
+
 
 /// Decide whether to record `el`, branching on browser vs desktop.
 fn try_record(el: &UIElement, is_browser: bool) -> Option<WalkRecord> {

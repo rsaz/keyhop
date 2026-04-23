@@ -149,31 +149,53 @@ pub struct HintStyle {
 }
 
 impl HintStyle {
-    /// Compact, dense badges meant to sit on top of small UI controls.
-    /// No extra-text rendering needed — element labels carry enough
-    /// information on their own (the user is reading the underlying UI).
+    /// Compact "vimium-style" corner badges meant to sit *inside* the
+    /// top-left corner of small UI controls without obscuring the rest
+    /// of the control. Tuned for dense screens (multi-monitor + busy
+    /// app like Cursor / VS Code) where the previous "above the
+    /// control" placement produced a wall of overlapping badges.
+    ///
+    /// Three deliberate departures from the v0.4.0 preset:
+    ///
+    /// 1. **Smaller font and padding** — the badge has to fit inside
+    ///    the click target's corner, so it must shrink to ~13px and use
+    ///    1-2px of padding.
+    /// 2. **Lower opacity (~76%)** — the user needs to read the
+    ///    underlying icon/label *through* the badge before committing.
+    ///    230/255 was almost fully opaque; 195 keeps text legible while
+    ///    the control's own glyph still bleeds through.
+    /// 3. **Inside-anchor preferred** — `TopLeft` is tried first so the
+    ///    badge sits in the corner of its element. The leader-line
+    ///    renderer auto-skips the connector when the badge is inside
+    ///    the target, so the visual is just `[a]` in the corner with
+    ///    the element outlined.
     pub fn elements() -> Self {
         Self {
-            font_height: 16,
+            font_height: 13,
             badge_bg: COLORREF(0x0000E5FF), // BGR yellow
             badge_fg: COLORREF(0x00000000),
             border: COLORREF(0x00202020),
             extra_bg: COLORREF(0x00202020),
             extra_fg: COLORREF(0x00FFFFFF),
-            padding_x: 5,
-            padding_y: 2,
-            // ~90% opaque: badges are clearly readable but the underlying
-            // control still hints through, so the user can see what they're
-            // about to invoke before committing.
-            badge_opacity: 230,
-            text_shadow: false,
+            padding_x: 3,
+            padding_y: 1,
+            // ~76% opaque: small enough to see through, large enough to
+            // stay readable on busy backgrounds. Combined with the
+            // text_shadow below this trades a little legibility for a
+            // dramatically calmer overlay.
+            badge_opacity: 195,
+            // Compensate for the lower opacity by giving the label a 1px
+            // shadow — keeps single-letter labels readable when sitting
+            // on a high-contrast icon.
+            text_shadow: true,
             show_leader: true,
             // Same dark grey as the badge border — visually subordinate to
             // the badge itself but contrasts well against typical app UIs.
             leader_color: COLORREF(0x00202020),
-            // Element controls are usually small; placing the badge above
-            // them keeps the underlying UI visible while the user picks.
-            prefer_inside_anchor: false,
+            // Anchor inside the top-left corner of the control. Combined
+            // with the smaller font this leaves the rest of the control
+            // visible so the user can confirm what they're about to click.
+            prefer_inside_anchor: true,
         }
     }
 
@@ -1712,16 +1734,18 @@ mod layout_tests {
     }
 
     #[test]
-    fn element_style_places_single_hint_outside_top() {
-        // The element style prefers `OutsideTop` so the badge sits just
-        // above the control instead of covering it. For an element at
-        // (100, 200) the badge top should be lifted by `font_height +
-        // padding_y * 2 + PILL_GAP`.
+    fn element_style_places_single_hint_inside_top_left() {
+        // v0.4.x: the element style now prefers `TopLeft` so the badge
+        // sits inside the top-left corner of the control rather than
+        // floating above it. Combined with the smaller font + lower
+        // opacity this keeps the rest of the control visible while the
+        // user types — the previous OutsideTop placement turned dense
+        // screens (multi-monitor + Cursor / VS Code) into a wall of
+        // overlapping badges.
         let style = element_style();
         let laid = lay_out(&[hint(100, 200, 50, 30, "a")], &style, 0, 0);
-        let row_h = style.font_height + style.padding_y * 2;
         assert_eq!(laid[0].badge_rect.left, 100);
-        assert_eq!(laid[0].badge_rect.top, 200 - row_h - PILL_GAP);
+        assert_eq!(laid[0].badge_rect.top, 200);
     }
 
     #[test]
