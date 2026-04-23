@@ -4,7 +4,7 @@
 
 `keyhop` is a system-wide keyboard navigation layer that lets you control your whole computer without ever touching the mouse. Reaching for the mouse forces a constant context switch between thinking and pointing — your hands leave the home row, your eyes hunt for a cursor, and your flow breaks. `keyhop` keeps you on the keyboard so you stay fast, focused, and productive, using OS accessibility APIs (UI Automation on Windows) to target native UI elements semantically.
 
-**Status:** v0.2.0 — Windows backend with visual configuration, customizable hotkeys/colors/alphabet, and Windows startup integration. Linux backend planned.
+**Status:** v0.3.0 — Windows backend with full webpage content detection (Chromium browsers), multi-monitor window picker, lifecycle controls (`keyhop --close`, `--clear-logs`, daily log rotation), visual Settings dialog, and a real **MSI installer** (no MSVC toolchain required to install). Linux backend planned.
 
 [![ci](https://github.com/rsaz/keyhop/actions/workflows/ci.yml/badge.svg)](https://github.com/rsaz/keyhop/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/keyhop.svg)](https://crates.io/crates/keyhop)
@@ -23,21 +23,27 @@
 keyhop/
 ├─ src/
 │  ├─ lib.rs               # public API: Action, Backend, Element, HintEngine
-│  ├─ main.rs              # the `keyhop` binary
+│  ├─ main.rs              # the `keyhop` binary (CLI flags, IPC, message loop)
 │  ├─ model.rs
 │  ├─ action.rs
 │  ├─ backend.rs
 │  ├─ hint.rs
 │  ├─ config.rs            # TOML config (%APPDATA%/keyhop/config.toml)
 │  └─ windows/             # Windows backend (cfg(windows) only)
-│     ├─ mod.rs            # WindowsBackend (UI Automation tree walk)
+│     ├─ mod.rs            # WindowsBackend (UI Automation tree walk + browser activation)
 │     ├─ hotkey.rs         # global leader hotkeys + chord parser
 │     ├─ overlay.rs        # transparent layered hint overlay + color parser
 │     ├─ tray.rs           # system tray icon + context menu
 │     ├─ settings_window.rs # visual Settings dialog (Win32)
 │     ├─ startup.rs        # "launch at login" via HKCU Run key
 │     ├─ notification.rs   # MessageBox-backed user notifications
-│     └─ window_picker.rs  # Alt-Tab-style window picker
+│     ├─ window_picker.rs  # Alt-Tab-style window picker (multi-monitor, restores minimized)
+│     ├─ single_instance.rs # named-mutex guard so only one keyhop runs
+│     └─ ipc.rs            # hidden message-only window for `keyhop --close`
+├─ wix/
+│  └─ main.wxs             # WiX 3 source for the MSI installer
+├─ docs/
+│  └─ CODE_SIGNING.md      # Microsoft Trusted Signing setup (deferred)
 └─ examples/
    └─ enumerate_foreground.rs
 ```
@@ -99,11 +105,13 @@ The binary uses the Windows GUI subsystem in release builds, running silently in
 
 ### Flags
 
-| Flag                  | What it does                                                |
-| --------------------- | ----------------------------------------------------------- |
-| `-h`, `--help`        | Print usage and exit.                                       |
-| `-V`, `--version`     | Print version and exit.                                     |
-| `--no-tray`           | Run without the system tray icon (hotkeys-only mode).       |
+| Flag                  | What it does                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------- |
+| `-h`, `--help`        | Print usage and exit.                                                                 |
+| `-V`, `--version`     | Print version and exit.                                                               |
+| `--no-tray`           | Run without the system tray icon (hotkeys-only mode).                                 |
+| `--close`, `--quit`   | Cleanly shut down the running keyhop instance (uses a hidden IPC window). Exits 0.    |
+| `--clear-logs`        | Delete every `keyhop*.log` under `%LOCALAPPDATA%\keyhop\`. Run `--close` first if the live instance has the file open. |
 
 ## Using it
 
@@ -121,7 +129,11 @@ After launching, `keyhop` registers two global hotkeys and a tray icon. The defa
 
 The tray icon's right-click menu mirrors the two leader chords, gives you a `Settings...` entry to customize keyhop visually, and (in release builds) a `View Log` shortcut so you can debug without leaving the keyboard.
 
-Yellow badges = element picker (will *invoke* the control). Orange badges = window picker (will *focus* the window). Both show the hint letters on the home row by default — but as of v0.2.0 you can change the colors and the alphabet from `Settings...`.
+Yellow badges = element picker (will *invoke* the control). Orange badges = window picker (will *focus* the window). Both show the hint letters on the home row by default — colors and the alphabet are editable from `Settings...`.
+
+### Web browsers
+
+`Ctrl+Shift+Space` works inside Chromium-based browsers (Chrome, Edge, Brave, Opera, Vivaldi, Arc) and finds the actual links, buttons, file rows, nav tabs, and form inputs *inside* the rendered page — not just the browser chrome. keyhop wakes up Chromium's accessibility tree on demand by sending `WM_GETOBJECT` to every renderer HWND before walking, and descends 32 levels deep on browser foregrounds (vs 12 for desktop apps) since DOM trees routinely nest 15–25 deep. Firefox is on the roadmap for v0.4.x; today it surfaces only chrome elements.
 
 ## Configuration
 
@@ -220,15 +232,30 @@ fn enumerate() -> anyhow::Result<()> {
 - [x] Scroll action wired through UIA `UIScrollPattern`
 - [x] User-facing notifications (no elements found, hotkey conflict, action failed)
 
-### Next up (v0.3.0) — Linux backend
+### Shipped (v0.3.0)
+
+- [x] Browser webpage content detection (Chrome / Edge / Brave / Opera / Vivaldi / Arc) via on-demand Chromium accessibility-tree activation (`WM_GETOBJECT` to every renderer HWND) plus a 32-level UIA walk on browser foregrounds
+- [x] Multi-monitor window picker fixes: badges anchor inside the title bar (visible on maximized windows), DWM-cloaked background UWP apps are filtered out, and selecting a minimized window restores it before focusing
+- [x] Element-picker badge UX: smaller font, layout pass tries `OutsideTop` first so the underlying control stays visible
+- [x] `keyhop --close` / `--quit` — cleanly shut down a running instance from any terminal (hidden message-only IPC window translates `WM_CLOSE` into the same path the tray's "Quit" entry uses)
+- [x] `keyhop --clear-logs` — wipes log files under `%LOCALAPPDATA%\keyhop\`
+- [x] Daily log rotation with 7-file retention (replaces the unbounded single `keyhop.log`)
+- [x] Walk diagnostics — every `enumerate_foreground` logs nodes visited, deepest depth, and whether the depth/element cap was hit
+- [x] **MSI installer** (`Keyhop-<version>-x86_64.msi`) — silent-install, single ARP entry, Start Menu shortcut, PATH integration; built by `cargo wix` and attached to every GitHub Release
+- [x] CI: `release.yml` builds and attaches both `keyhop.exe` and the MSI; `actions/checkout` and `softprops/action-gh-release` bumped to Node.js 24 versions
+- [x] Dependabot configured (`cargo` + `github-actions`, weekly)
+
+### Next up (v0.4.0) — Linux backend + signing
 
 - [ ] Linux backend via AT-SPI (X11 first, then Wayland)
 - [ ] Linux global hotkey integration (X11 `XGrabKey` / Wayland portal)
 - [ ] Linux overlay rendering (X11 `_NET_WM_STATE_ABOVE` layered window first; layer-shell on Wayland later)
 - [ ] Linux tray icon via the StatusNotifierItem / AppIndicator protocol
 - [ ] Smoke-test on GNOME (Wayland), KDE (X11), and a tiling WM (i3 or Sway)
+- [ ] Microsoft Trusted Signing for the MSI + EXE (kills the SmartScreen "unknown publisher" warning; see [`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md))
+- [ ] Firefox accessibility-tree activation (Gecko uses a different IPC dance than Chromium's `WM_GETOBJECT`)
 
-### v0.4.0 — macOS backend
+### v0.5.0 — macOS backend
 
 - [ ] macOS backend via the Accessibility API (`AXUIElement`)
 - [ ] macOS global hotkeys via `RegisterEventHotKey` / `MASShortcut`-style API
@@ -236,13 +263,13 @@ fn enumerate() -> anyhow::Result<()> {
 - [ ] macOS menu bar item with the same Settings / Pick / Quit affordances as the Windows tray
 - [ ] Notarized `.app` bundle build pipeline
 
-### v0.5.0 — Polish, click-through, installers
+### v0.6.0 — Polish + cross-distro install
 
 - [ ] Polished tray icon (multi-resolution `.ico` instead of the procedural badge)
 - [ ] Hot-reload config without restarting (re-register hotkeys at runtime)
 - [ ] Per-color overrides exposed in the Settings dialog (today only badge backgrounds are editable)
 - [ ] Click-through overlay so non-target apps still see the mouse
-- [ ] MSI installer + Winget manifest (Windows)
+- [ ] Winget manifest (Windows)
 - [ ] Linux installer story: `.deb` + `.rpm` packages, plus a Flatpak manifest
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
@@ -256,6 +283,22 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+### Building the installer locally
+
+The repo ships a [`Scripts.toml`](Scripts.toml) for [`cargo-run`](https://crates.io/crates/cargo-run) that wraps the MSI build:
+
+```powershell
+cargo install --locked cargo-run cargo-wix
+scoop install wixtoolset3              # or grab WiX 3.14 from wixtoolset.org
+
+cargo script msi                       # full: cargo build --release + cargo wix
+cargo script msi-only                  # MSI only (assumes target/release/keyhop.exe)
+cargo script msi-show                  # ls target/wix/*.msi
+cargo script msi-clean                 # rm target/wix
+```
+
+The `msi` script auto-detects WiX from `$env:WIX`, scoop's `wixtoolset3`, and the standard Program Files install paths.
 
 ## License
 
