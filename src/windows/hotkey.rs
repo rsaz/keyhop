@@ -230,9 +230,15 @@ pub struct RegistrationOutcome {
 ///   `End`, `PageUp`, `PageDown`, arrow keys (`Left`, `Right`, `Up`,
 ///   `Down`), `Comma`, `Period`, `Slash`, `Backslash`, `Semicolon`,
 ///   `Quote`, `BracketLeft`/`BracketRight`, `Minus`, `Equal`, `Backquote`.
+/// - Literal punctuation aliases for the keys above: `,` `.` `/` `\` `;`
+///   `'` `[` `]` `-` `=` `` ` `` — so users can write `Ctrl+\` or
+///   `Ctrl+/` exactly the way it appears on their keyboard instead of
+///   spelling out `Backslash` / `Slash`.
 ///
 /// The trailing token is always the key; everything before is a modifier.
-/// Whitespace and case are normalized.
+/// Whitespace and case are normalized. The literal `+` cannot be used as
+/// the key (it's the segment separator) — use `Equal` or `=` to bind the
+/// physical `+/=` key.
 pub fn parse_hotkey(s: &str) -> Result<(Modifiers, Code)> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -348,12 +354,12 @@ fn parse_code(s: &str) -> Result<Code> {
         "RIGHT" => Code::ArrowRight,
         "UP" => Code::ArrowUp,
         "DOWN" => Code::ArrowDown,
-        "COMMA" => Code::Comma,
-        "PERIOD" | "DOT" => Code::Period,
-        "SLASH" => Code::Slash,
-        "BACKSLASH" => Code::Backslash,
-        "SEMICOLON" => Code::Semicolon,
-        "QUOTE" | "APOSTROPHE" => Code::Quote,
+        "COMMA" | "," => Code::Comma,
+        "PERIOD" | "DOT" | "." => Code::Period,
+        "SLASH" | "/" => Code::Slash,
+        "BACKSLASH" | "\\" => Code::Backslash,
+        "SEMICOLON" | ";" => Code::Semicolon,
+        "QUOTE" | "APOSTROPHE" | "'" => Code::Quote,
         "BRACKETLEFT" | "[" => Code::BracketLeft,
         "BRACKETRIGHT" | "]" => Code::BracketRight,
         "MINUS" | "-" => Code::Minus,
@@ -430,5 +436,61 @@ mod tests {
         assert_eq!(m, Modifiers::META);
         let (m, _) = parse_hotkey("Super+A").unwrap();
         assert_eq!(m, Modifiers::META);
+    }
+
+    /// Regression for #3: `Ctrl+\` is on both sides of an ANSI keyboard
+    /// and was rejected because the parser only knew the spelled-out
+    /// `Backslash` form.
+    #[test]
+    fn parses_backslash_literal() {
+        let (m, c) = parse_hotkey(r"Ctrl+\").unwrap();
+        assert_eq!(m, Modifiers::CONTROL);
+        assert_eq!(c, Code::Backslash);
+    }
+
+    #[test]
+    fn parses_backslash_named_form_still_works() {
+        let (m, c) = parse_hotkey("Ctrl+Backslash").unwrap();
+        assert_eq!(m, Modifiers::CONTROL);
+        assert_eq!(c, Code::Backslash);
+    }
+
+    #[test]
+    fn parses_punctuation_literals() {
+        // Every printable punctuation alias should resolve to the same
+        // `Code` as its spelled-out twin.
+        let pairs: &[(&str, &str, Code)] = &[
+            ("Ctrl+,", "Ctrl+Comma", Code::Comma),
+            ("Ctrl+.", "Ctrl+Period", Code::Period),
+            ("Ctrl+/", "Ctrl+Slash", Code::Slash),
+            (r"Ctrl+\", "Ctrl+Backslash", Code::Backslash),
+            ("Ctrl+;", "Ctrl+Semicolon", Code::Semicolon),
+            ("Ctrl+'", "Ctrl+Quote", Code::Quote),
+            ("Ctrl+[", "Ctrl+BracketLeft", Code::BracketLeft),
+            ("Ctrl+]", "Ctrl+BracketRight", Code::BracketRight),
+            ("Ctrl+-", "Ctrl+Minus", Code::Minus),
+            ("Ctrl+=", "Ctrl+Equal", Code::Equal),
+            ("Ctrl+`", "Ctrl+Backquote", Code::Backquote),
+        ];
+        for (literal, named, expected) in pairs {
+            let (lm, lc) = parse_hotkey(literal)
+                .unwrap_or_else(|e| panic!("{literal} should parse but errored: {e}"));
+            let (nm, nc) = parse_hotkey(named)
+                .unwrap_or_else(|e| panic!("{named} should parse but errored: {e}"));
+            assert_eq!(lm, Modifiers::CONTROL, "{literal} modifiers");
+            assert_eq!(nm, Modifiers::CONTROL, "{named} modifiers");
+            assert_eq!(lc, *expected, "{literal} code");
+            assert_eq!(nc, *expected, "{named} code");
+            assert_eq!(lc, nc, "{literal} should equal {named}");
+        }
+    }
+
+    /// `Ctrl+\` plus surrounding whitespace — the kind of thing the
+    /// Settings dialog might hand us if the user pads the input.
+    #[test]
+    fn backslash_with_whitespace() {
+        let (m, c) = parse_hotkey(r"  Ctrl  +  \  ").unwrap();
+        assert_eq!(m, Modifiers::CONTROL);
+        assert_eq!(c, Code::Backslash);
     }
 }

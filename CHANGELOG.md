@@ -55,6 +55,17 @@ to install.
   about the `link.exe not found` failure mode that surfaced for users
   without Visual Studio Build Tools installed).
 
+### Fixed
+- **Hotkey parser: accept literal punctuation as the trailing key
+  ([#3](https://github.com/rsaz/keyhop/issues/3)).** `Ctrl+\` (and the
+  rest of the printable ANSI punctuation row — `,` `.` `/` `;` `'`
+  `[` `]` `-` `=` `` ` ``) are now valid hotkey strings, alongside the
+  spelled-out forms (`Backslash`, `Comma`, etc.) that already worked.
+  This unblocks chords that sit on both halves of the keyboard, like
+  `Ctrl+\`, which several users had asked for. The literal `+` cannot
+  be used as the trailing key (it's the segment separator) — bind the
+  physical `+/=` key via `Equal` or `=` instead.
+
 ### Security
 - **Dismiss GHSA-wrw7-89jp-8q8g (`glib < 0.20.0` `VariantStrIter`
   unsoundness, RUSTSEC-2024-0429) as `tolerable_risk`.** The vulnerable
