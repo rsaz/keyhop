@@ -95,12 +95,60 @@ crisper labels) and faster to *run* (cached enumeration, scoped walks).
   preset dropdown, three preset modifier checkboxes, custom-additions
   edit field, "Min single-key hints" edit (the new `min_singles`
   floor), scope-mode dropdown, max-elements edit, enable-caching
-  checkbox, and a cache-TTL edit. Window grew to 980×560 px to fit.
-  The "Exclude ambiguous characters" checkbox label reads `(O 0)` to
-  match the actual default exclusion list — `I` / `l` / `1` were
-  considered for the list but the new Consolas overlay font draws
-  them distinctly, so dropping them by default would silently shrink
-  the home-row preset from 9 chars to 8.
+  checkbox, and a cache-TTL edit. The "Exclude ambiguous characters"
+  checkbox label reads `(O 0)` to match the actual default exclusion
+  list — `I` / `l` / `1` were considered for the list but the new
+  Consolas overlay font draws them distinctly, so dropping them by
+  default would silently shrink the home-row preset from 9 chars to 8.
+- **Settings dialog UI overhaul (two-column, 860×640).** The vertical
+  scroll-pile is gone: General / Hints / Colors / Performance now sit
+  side-by-side in two columns so every option is visible without
+  scrolling. Every label has a hover **tooltip** (300 ms show / 8 s
+  linger) explaining what the setting does and what its sensible
+  range is — sourced from a single `tips` module so the wording stays
+  consistent with the README. Power-user controls were upgraded:
+    - **Color picker swatches.** Each `#RRGGBB` field grew a 28×24
+      owner-drawn swatch button to its right; clicking it opens the
+      Win32 `ChooseColorW` common dialog (with `CC_FULLOPEN` so the
+      custom-color matrix is available) and writes the selection
+      back into the hex edit. Typing into the edit still works and
+      live-updates the swatch on `EN_CHANGE`.
+    - **Opacity sliders.** Background and badge opacity are now
+      `msctls_trackbar32` trackbars (0–100, page 10, tick 10) with
+      a live "`82%`" value label that updates on `WM_HSCROLL` —
+      drag, click the trough, or arrow-key from the keyboard. The
+      old free-text "0..100 or blank" field is gone, which also
+      removes a class of typo-induced parse errors on Save.
+    - **Numeric spinners.** `min_singles`, `max_elements`, and
+      `cache_ttl_ms` are now `msctls_updown32` UpDown spinners
+      auto-buddied to their edit fields (`UDS_AUTOBUDDY |
+      UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS`), with
+      per-field min/max ranges enforced at the control level so
+      out-of-range values can't reach `Config::save`.
+- **Live config hot-reload.** Save / Reset to Defaults now apply
+  in-process — no restart, no overlay rebuild. The Settings dialog
+  returns the new `Config` to the main loop, which calls a new
+  `apply_config` helper that swaps the `HintEngine`, hint
+  styles, scope mode, `WindowsBackend` cache + max-elements, and
+  re-registers all hotkeys (dropping the old `Hotkeys` *before*
+  registering the new ones so `RegisterHotKey` doesn't trip over
+  its own per-process duplicate-chord rule). A "Settings applied"
+  toast confirms the change. Hotkey-conflict toasts continue to fire
+  if the user picks an already-claimed chord.
+- **`config.toml` file watcher.** A new
+  [`src/windows/config_watcher.rs`](src/windows/config_watcher.rs)
+  module watches `%APPDATA%\keyhop\config.toml` via the cross-platform
+  [`notify`](https://crates.io/crates/notify) crate. When the file
+  changes — whether the Settings dialog wrote it, the user
+  hand-edited it in their text editor, a cloud-sync agent dropped in
+  a new copy, or a future CLI subcommand mutated it — the watcher
+  posts a debounced (`150 ms`) `WM_USER_RELOAD_CONFIG` thread
+  message via `PostThreadMessageW` and the main loop reloads &
+  re-applies the config. The debounce window absorbs the
+  multi-write atomic-save sequence editors like VS Code, Notepad++,
+  and Vim use, so a single Save click triggers a single reload. The
+  watcher targets the parent directory (not the file itself) so
+  rename-over saves still fire the right events.
 
 ### Changed
 - **`HintEngine::default()` now uses `ShortestFirst`.** The legacy
@@ -126,7 +174,21 @@ crisper labels) and faster to *run* (cached enumeration, scoped walks).
 
 ### Internals
 - New modules: [`src/alphabet_presets.rs`](src/alphabet_presets.rs),
-  [`src/cache.rs`](src/cache.rs).
+  [`src/cache.rs`](src/cache.rs),
+  [`src/windows/config_watcher.rs`](src/windows/config_watcher.rs).
+- New dependency: [`notify = "6"`](https://crates.io/crates/notify)
+  for the cross-platform `config.toml` file watcher (only used on
+  Windows in practice — the watcher itself is `cfg(windows)`-gated).
+- New `windows` feature flag: `Win32_UI_Controls_Dialogs` for the
+  `ChooseColorW` common dialog used by the Settings color-picker
+  swatches. Two trackbar/updown control class names and one
+  trackbar message id (`TBM_GETPOS`) are defined locally because
+  `windows` 0.58 doesn't generate them.
+- `main.rs` gained an `apply_config(new, &mut Runtime, &mut Backend,
+  &mut Hotkeys, announce)` helper that centralises every step of a
+  hot-reload (engine swap, style swap, backend reconfigure,
+  hotkey re-registration, registry sync, optional toast). Both the
+  Settings-dialog return path and the file-watcher path call it.
 - 30+ new unit tests covering: variable-length label generation
   (single-char, mixed-length, prefix-collision invariants at scale,
   degenerate 1-char alphabet), the alphabet builder (every preset,

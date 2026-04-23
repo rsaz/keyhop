@@ -8,6 +8,7 @@
 //! collects on-screen, interactable elements (buttons, links, inputs, menu
 //! items, ...) into the platform-agnostic [`crate::Element`] model.
 
+pub mod config_watcher;
 pub mod hotkey;
 pub mod ipc;
 pub mod notification;

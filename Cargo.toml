@@ -38,12 +38,18 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
+    # ChooseColorW common dialog for the Settings color-picker swatches.
+    "Win32_UI_Controls_Dialogs",
 ] }
 uiautomation = "0.24"
 global-hotkey = "0.7"
 # default-features off skips the X11 (`libxdo`) backend muda would pull in
 # otherwise — pure dead weight on Windows.
 tray-icon = { version = "0.22", default-features = false }
+# Cross-platform file-system watcher backing the live `config.toml`
+# reload. Only used on Windows in practice (the rest of the watcher
+# code is `cfg(windows)`-gated) but `notify` itself is portable.
+notify = "6"
 
 [profile.release]
 lto = "thin"
