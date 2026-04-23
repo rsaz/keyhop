@@ -75,13 +75,14 @@ impl Tray {
         let pick_window = MenuItem::new("Pick window\tCtrl+Alt+Space", true, None);
         // Disabled label, just to expose the version inside the menu.
         let about = MenuItem::new(concat!("keyhop v", env!("CARGO_PKG_VERSION")), false, None);
-        let settings = MenuItem::new("Settings...", true, None);
+        // Settings shows its default chord too, mirroring the format used
+        // by the picker entries above.
+        let settings = MenuItem::new("Settings...\tCtrl+Shift+,", true, None);
 
-        // Only show "View Log" in release builds where logs go to a file.
-        #[cfg(not(debug_assertions))]
+        // View Log is always present so users always have a one-click
+        // path to the file. Debug builds (where logs go to stderr) just
+        // show a notification explaining that.
         let view_log = Some(MenuItem::new("View Log", true, None));
-        #[cfg(debug_assertions)]
-        let view_log: Option<MenuItem> = None;
 
         let quit = MenuItem::new("Quit", true, None);
 
@@ -97,7 +98,6 @@ impl Tray {
             .context("appending separator")?;
         menu.append(&settings).context("appending Settings item")?;
 
-        #[cfg(not(debug_assertions))]
         if let Some(ref view_log_item) = view_log {
             menu.append(view_log_item)
                 .context("appending View Log item")?;
@@ -167,62 +167,264 @@ impl Tray {
     }
 }
 
-/// Build the tray icon procedurally so we don't need to ship a binary
-/// `.ico` asset. Layout: 32×32 yellow square, 2-pixel dark border, with a
-/// 5×7 pixel "K" glyph scaled 3× and centred.
+/// Build a polished tray icon procedurally. Rendered at 4× the target
+/// resolution and downsampled with a box filter for free anti-aliasing
+/// on the rounded corners and the diagonal strokes of the "K" glyph.
+///
+/// The icon is a yellow keycap with a subtle vertical gradient for
+/// depth, a soft dark outline for legibility against light tray
+/// backgrounds, and a bold white "K" centred on it.
 fn build_icon() -> Result<Icon> {
-    let size = TRAY_ICON_PX as usize;
-    let mut buf = vec![0u8; size * size * 4];
+    const SUPERSAMPLE: u32 = 4;
+    let target = TRAY_ICON_PX;
+    let big = target * SUPERSAMPLE;
 
-    // Vimium-ish yellow background (R=255 G=229 B=0).
-    const YELLOW: [u8; 4] = [0xFF, 0xE5, 0x00, 0xFF];
-    const DARK: [u8; 4] = [0x1A, 0x1A, 0x1A, 0xFF];
+    let buf_big = render_icon_high_res(big);
+    let buf_small = downsample(&buf_big, big as usize, target as usize, SUPERSAMPLE as usize);
 
-    for px in buf.chunks_exact_mut(4) {
-        px.copy_from_slice(&YELLOW);
-    }
+    Icon::from_rgba(buf_small, target, target).context("Icon::from_rgba")
+}
 
-    // 2-pixel dark border so the badge reads against any tray background.
-    let border = 2usize;
-    for y in 0..size {
-        for x in 0..size {
-            if x < border || x >= size - border || y < border || y >= size - border {
-                let i = (y * size + x) * 4;
-                buf[i..i + 4].copy_from_slice(&DARK);
+/// Render the icon at high resolution. Working at 128×128 (32 × 4)
+/// gives the box-filter downsample enough samples per output pixel
+/// to produce smooth edges.
+fn render_icon_high_res(size: u32) -> Vec<u8> {
+    let s = size as i32;
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+
+    // Subtle 1-pixel margin (at the high-res scale that's 4px) so the
+    // outline doesn't get clipped after downsampling.
+    let margin = (size as i32) / 32; // ~1px equivalent
+    let radius = (size as i32) * 6 / 32; // ~6px equivalent at 32x32
+    let outline_w = (size as i32) / 32; // ~1px outline
+
+    // Yellow gradient endpoints — top brighter, bottom slightly darker
+    // for a subtle keycap-bevel look. Values picked to evoke a real
+    // physical keycap rather than a flat sticker.
+    const YELLOW_TOP: [u8; 3] = [0xFF, 0xD9, 0x1F];
+    const YELLOW_BOT: [u8; 3] = [0xF5, 0xB7, 0x00];
+    const OUTLINE: [u8; 3] = [0x1A, 0x1A, 0x1A];
+    const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
+
+    let cap_x0 = margin;
+    let cap_y0 = margin;
+    let cap_x1 = s - margin;
+    let cap_y1 = s - margin;
+
+    for y in 0..s {
+        for x in 0..s {
+            let i = ((y * s + x) * 4) as usize;
+
+            // Inside the keycap?
+            if inside_rounded_rect(x, y, cap_x0, cap_y0, cap_x1, cap_y1, radius) {
+                // Vertical gradient
+                let t = (y - cap_y0) as f32 / (cap_y1 - cap_y0) as f32;
+                let r = lerp(YELLOW_TOP[0], YELLOW_BOT[0], t);
+                let g = lerp(YELLOW_TOP[1], YELLOW_BOT[1], t);
+                let b = lerp(YELLOW_TOP[2], YELLOW_BOT[2], t);
+                buf[i] = r;
+                buf[i + 1] = g;
+                buf[i + 2] = b;
+                buf[i + 3] = 0xFF;
+            } else if inside_rounded_rect(
+                x,
+                y,
+                cap_x0 - outline_w,
+                cap_y0 - outline_w,
+                cap_x1 + outline_w,
+                cap_y1 + outline_w,
+                radius + outline_w,
+            ) {
+                // Outline ring
+                buf[i] = OUTLINE[0];
+                buf[i + 1] = OUTLINE[1];
+                buf[i + 2] = OUTLINE[2];
+                buf[i + 3] = 0xFF;
             }
         }
     }
 
-    // 5-wide × 7-tall "K" bitmap. Each row is left-to-right; 1 = ink.
-    const K: [[u8; 5]; 7] = [
-        [1, 0, 0, 0, 1],
-        [1, 0, 0, 1, 0],
-        [1, 0, 1, 0, 0],
-        [1, 1, 0, 0, 0],
-        [1, 0, 1, 0, 0],
-        [1, 0, 0, 1, 0],
-        [1, 0, 0, 0, 1],
-    ];
-    let scale = 3usize;
-    let glyph_w = 5 * scale;
-    let glyph_h = 7 * scale;
-    let off_x = (size - glyph_w) / 2;
-    let off_y = (size - glyph_h) / 2;
-    for (gy, row) in K.iter().enumerate() {
-        for (gx, &on) in row.iter().enumerate() {
-            if on == 0 {
-                continue;
-            }
-            for sy in 0..scale {
-                for sx in 0..scale {
-                    let x = off_x + gx * scale + sx;
-                    let y = off_y + gy * scale + sy;
-                    let i = (y * size + x) * 4;
-                    buf[i..i + 4].copy_from_slice(&DARK);
+    // Draw the "K" using thick strokes at high resolution. Three lines:
+    //   1. Vertical stroke on the left
+    //   2. Upper diagonal from middle-left to top-right
+    //   3. Lower diagonal from middle-left to bottom-right
+    // Stroke width and positioning chosen to look balanced after the
+    // downsample to 32px.
+    let stroke = (size as i32) * 5 / 32; // ~5px-equivalent thickness
+    let glyph_inset = (size as i32) * 8 / 32; // padding inside the keycap
+    let gx0 = cap_x0 + glyph_inset;
+    let gy0 = cap_y0 + glyph_inset - (size as i32) / 32;
+    let gx1 = cap_x1 - glyph_inset;
+    let gy1 = cap_y1 - glyph_inset + (size as i32) / 32;
+    let gmid_y = (gy0 + gy1) / 2;
+    let vert_x = gx0;
+
+    // Vertical stroke
+    fill_rect(&mut buf, s, vert_x, gy0, vert_x + stroke, gy1, &WHITE);
+
+    // Upper diagonal: from (vert_x + stroke, gmid_y) to (gx1, gy0)
+    draw_thick_line(
+        &mut buf,
+        s,
+        vert_x + stroke,
+        gmid_y,
+        gx1,
+        gy0,
+        stroke,
+        &WHITE,
+    );
+
+    // Lower diagonal: from (vert_x + stroke, gmid_y) to (gx1, gy1)
+    draw_thick_line(
+        &mut buf,
+        s,
+        vert_x + stroke,
+        gmid_y,
+        gx1,
+        gy1,
+        stroke,
+        &WHITE,
+    );
+
+    buf
+}
+
+/// Box-filter downsample from `src_size`² to `dst_size`² (premultiplied
+/// average over `factor`² source pixels, in straight RGBA space). Cheap
+/// and gives respectable anti-aliasing for the icon rendering above.
+fn downsample(src: &[u8], src_size: usize, dst_size: usize, factor: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dst_size * dst_size * 4];
+    for dy in 0..dst_size {
+        for dx in 0..dst_size {
+            let mut r: u32 = 0;
+            let mut g: u32 = 0;
+            let mut b: u32 = 0;
+            let mut a: u32 = 0;
+            for sy in 0..factor {
+                for sx in 0..factor {
+                    let src_x = dx * factor + sx;
+                    let src_y = dy * factor + sy;
+                    let i = (src_y * src_size + src_x) * 4;
+                    let alpha = src[i + 3] as u32;
+                    // Premultiply so transparent pixels don't bleed
+                    // their colour into the average.
+                    r += src[i] as u32 * alpha / 255;
+                    g += src[i + 1] as u32 * alpha / 255;
+                    b += src[i + 2] as u32 * alpha / 255;
+                    a += alpha;
                 }
             }
+            let count = (factor * factor) as u32;
+            let dst_i = (dy * dst_size + dx) * 4;
+            let out_a = a / count;
+            // Un-premultiply so the saved RGBA buffer matches what
+            // tray-icon expects.
+            if out_a > 0 {
+                out[dst_i] = ((r / count) * 255 / out_a).min(255) as u8;
+                out[dst_i + 1] = ((g / count) * 255 / out_a).min(255) as u8;
+                out[dst_i + 2] = ((b / count) * 255 / out_a).min(255) as u8;
+            }
+            out[dst_i + 3] = out_a as u8;
         }
     }
+    out
+}
 
-    Icon::from_rgba(buf, TRAY_ICON_PX, TRAY_ICON_PX).context("Icon::from_rgba")
+fn lerp(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (a as f32 * (1.0 - t) + b as f32 * t).round() as u8
+}
+
+fn fill_rect(buf: &mut [u8], stride: i32, x0: i32, y0: i32, x1: i32, y1: i32, rgb: &[u8; 3]) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if x < 0 || y < 0 || x >= stride || y >= stride {
+                continue;
+            }
+            let i = ((y * stride + x) * 4) as usize;
+            buf[i] = rgb[0];
+            buf[i + 1] = rgb[1];
+            buf[i + 2] = rgb[2];
+            buf[i + 3] = 0xFF;
+        }
+    }
+}
+
+/// Draw a thick line by stamping a square of side `thickness` at every
+/// pixel along the Bresenham path between the endpoints. Crude but
+/// produces clean diagonals at supersampled resolution.
+fn draw_thick_line(
+    buf: &mut [u8],
+    stride: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    thickness: i32,
+    rgb: &[u8; 3],
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut x = x0;
+    let mut y = y0;
+    let half = thickness / 2;
+
+    loop {
+        // Stamp a filled square centred on (x, y)
+        for oy in -half..=half {
+            for ox in -half..=half {
+                let px = x + ox;
+                let py = y + oy;
+                if px < 0 || py < 0 || px >= stride || py >= stride {
+                    continue;
+                }
+                let i = ((py * stride + px) * 4) as usize;
+                buf[i] = rgb[0];
+                buf[i + 1] = rgb[1];
+                buf[i + 2] = rgb[2];
+                buf[i + 3] = 0xFF;
+            }
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+/// Inside test for a rounded rectangle. Standard "rect with quarter-
+/// circle corners" SDF — coordinates outside the bounding box are out;
+/// inside the corner-radius square we test against the corner circle.
+fn inside_rounded_rect(x: i32, y: i32, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) -> bool {
+    if x < x0 || x >= x1 || y < y0 || y >= y1 {
+        return false;
+    }
+    let cx = if x < x0 + r {
+        x0 + r
+    } else if x >= x1 - r {
+        x1 - r - 1
+    } else {
+        return true;
+    };
+    let cy = if y < y0 + r {
+        y0 + r
+    } else if y >= y1 - r {
+        y1 - r - 1
+    } else {
+        return true;
+    };
+    let dx = x - cx;
+    let dy = y - cy;
+    dx * dx + dy * dy <= r * r
 }

@@ -15,6 +15,7 @@ pub mod notification;
 pub mod overlay;
 pub mod settings_window;
 pub mod single_instance;
+pub mod splash_screen;
 pub mod startup;
 pub mod tray;
 pub mod window_picker;

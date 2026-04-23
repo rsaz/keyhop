@@ -708,6 +708,7 @@ dependencies = [
  "anyhow",
  "global-hotkey",
  "notify",
+ "png 0.17.16",
  "serde",
  "toml 1.1.2+spec-1.1.0",
  "tracing",

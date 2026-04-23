@@ -27,6 +27,7 @@ use keyhop::windows::{
     overlay::{pick_hint, Hint, HintStyle},
     settings_window,
     single_instance::InstanceGuard,
+    splash_screen::SplashScreen,
     startup,
     tray::{Tray, TrayCommand},
     window_picker,
@@ -172,6 +173,19 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         }
     };
 
+    // Show splash screen during initialization. Track when it appeared so
+    // we can enforce a minimum display time below — on fast machines the
+    // rest of init finishes in <100ms and the splash would otherwise
+    // flash by too quickly for the user to register.
+    let splash_shown_at = std::time::Instant::now();
+    let splash = match SplashScreen::show() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to show splash screen; continuing anyway");
+            None
+        }
+    };
+
     // Hidden IPC window so a future `keyhop --close` can find this
     // process and ask it to shut down. Held alive until the message
     // loop exits; dropping it destroys the window.
@@ -266,6 +280,34 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     }
     println!();
     println!("Switch focus to any app, then press a leader.");
+
+    // Keep the splash visible for at least 3s so the user actually sees
+    // the brand mark on fast machines where init completes in <100ms.
+    // Pump messages while we wait so the splash stays painted.
+    if splash.is_some() {
+        const MIN_SPLASH_MS: u128 = 3000;
+        let elapsed = splash_shown_at.elapsed().as_millis();
+        if elapsed < MIN_SPLASH_MS {
+            let remaining = MIN_SPLASH_MS - elapsed;
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(remaining as u64);
+            use ::windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW as DM, PeekMessageW as PM, TranslateMessage as TM, MSG as M,
+                PM_REMOVE as PMR,
+            };
+            let mut m = M::default();
+            while std::time::Instant::now() < deadline {
+                unsafe {
+                    while PM(&mut m, None, 0, 0, PMR).as_bool() {
+                        let _ = TM(&m);
+                        DM(&m);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        }
+    }
+    drop(splash);
 
     let mut runtime = Runtime {
         hint_engine,
@@ -379,15 +421,28 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
                             notification::error("Couldn't open Settings", &format!("{e}"));
                         }
                     },
-                    #[cfg(not(debug_assertions))]
                     TrayCommand::ViewLog => {
-                        if let Err(e) = open_log_file() {
-                            tracing::error!(error = ?e, "failed to open log file");
+                        #[cfg(not(debug_assertions))]
+                        {
+                            if let Err(e) = open_log_file() {
+                                tracing::error!(error = ?e, "failed to open log file");
+                                notification::error(
+                                    "keyhop: couldn't open log",
+                                    &format!("{e}"),
+                                );
+                            }
                         }
-                    }
-                    #[cfg(debug_assertions)]
-                    TrayCommand::ViewLog => {
-                        // ViewLog shouldn't be available in debug builds, but handle it gracefully
+                        #[cfg(debug_assertions)]
+                        {
+                            // Debug builds write to stderr, so there's no
+                            // log file to open. Surface that to the user
+                            // rather than silently doing nothing.
+                            notification::info(
+                                "View Log unavailable",
+                                "Debug builds write logs to stderr, not to a file. \
+                                Run the release build to use this option.",
+                            );
+                        }
                     }
                     TrayCommand::Quit => {
                         tracing::info!("quit requested from tray");

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Splash screen** — a centered 400×400 borderless window displaying the store logo is now shown during app initialization, providing visual feedback that keyhop is loading.
+- **Store logo as tray icon** — the system tray icon now uses the official store logo instead of the procedurally generated yellow "K" badge, providing a more polished appearance.
 - **Open settings hotkey** — new global hotkey (`Ctrl+Shift+,` by default) to open the Settings dialog directly from anywhere. Previously, settings could only be opened from the tray menu.
 
 ### Changed
