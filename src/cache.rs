@@ -22,6 +22,7 @@
 //! the map from accumulating long-dead HWNDs).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Element;
@@ -54,16 +55,19 @@ impl Clock for SystemClock {
 }
 
 /// Single cache entry: the enumerated elements plus when they were
-/// captured. Held by-value inside the `HashMap` — we hand callers
-/// freshly-cloned `Vec<Element>` rather than borrowing through the
-/// guard so the manager doesn't have to stay borrowed across the
-/// lifetime of the returned data.
+/// captured. Held by-value inside the `HashMap` — we hand callers a
+/// refcount-bumped `Arc<[Element]>` rather than allocating + copying
+/// the vector on every hit. With Phase 4 of the perf plan the same
+/// slice is shared between the synchronous hotkey path and the
+/// pre-warm worker; using `Arc` means neither side has to clone the
+/// payload to pass it across the (`parking_lot::Mutex`-guarded) cache.
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    /// Elements as returned by the backend's enumerator. Cloned out
-    /// on each cache hit; `Element` is cheap to clone (fixed-size
-    /// fields plus an Option<String>).
-    pub elements: Vec<Element>,
+    /// Enumerated elements as a shared, immutable slice. `Arc::clone`
+    /// is a single atomic increment — independent of element count —
+    /// which matters for browser windows where the slice can hold
+    /// thousands of entries.
+    pub elements: Arc<[Element]>,
     /// When this entry was inserted, used to compute age against the
     /// configured TTL.
     pub captured_at: Instant,
@@ -114,11 +118,13 @@ impl<C: Clock> CacheManager<C> {
         }
     }
 
-    /// Look up `key`. Returns `Some(elements_clone)` when there's an
+    /// Look up `key`. Returns `Some(Arc<[Element]>)` when there's an
     /// entry younger than `ttl_ms`, `None` otherwise. Stale entries
     /// are removed in passing so subsequent calls don't pay the
-    /// freshness check.
-    pub fn get(&mut self, key: WindowKey) -> Option<Vec<Element>> {
+    /// freshness check. The returned `Arc` is a refcount bump — no
+    /// allocation, no element copies — so big browser caches don't
+    /// pay an O(N) hit on every cache lookup.
+    pub fn get(&mut self, key: WindowKey) -> Option<Arc<[Element]>> {
         if !self.enabled {
             return None;
         }
@@ -126,7 +132,7 @@ impl<C: Clock> CacheManager<C> {
         match self.entries.get(&key) {
             Some(entry) if now.duration_since(entry.captured_at) <= self.ttl => {
                 tracing::debug!(key, age_ms = now.duration_since(entry.captured_at).as_millis() as u64, "cache hit");
-                Some(entry.elements.clone())
+                Some(Arc::clone(&entry.elements))
             }
             Some(_) => {
                 tracing::debug!(key, "cache entry expired");
@@ -141,7 +147,11 @@ impl<C: Clock> CacheManager<C> {
     /// the same key. No-op when caching is disabled — the backend
     /// always calls `insert` after a successful walk so it doesn't
     /// have to branch on `enabled` at every call site.
-    pub fn insert(&mut self, key: WindowKey, elements: Vec<Element>) {
+    ///
+    /// The slice is moved (not cloned) into the entry; the same
+    /// `Arc` is then handed back from every subsequent
+    /// [`Self::get`] until the entry expires.
+    pub fn insert(&mut self, key: WindowKey, elements: Arc<[Element]>) {
         if !self.enabled {
             return;
         }
@@ -275,10 +285,14 @@ mod tests {
         assert!(c.get(42).is_none());
     }
 
+    fn arc_of(elements: Vec<Element>) -> Arc<[Element]> {
+        Arc::from(elements.into_boxed_slice())
+    }
+
     #[test]
     fn insert_then_get_round_trips() {
         let mut c = cache(500);
-        c.insert(1, vec![fake_element(1), fake_element(2)]);
+        c.insert(1, arc_of(vec![fake_element(1), fake_element(2)]));
         let got = c.get(1).expect("fresh entry should hit");
         assert_eq!(got.len(), 2);
     }
@@ -286,7 +300,7 @@ mod tests {
     #[test]
     fn entry_expires_after_ttl() {
         let mut c = cache(100);
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         c.clock.advance(Duration::from_millis(101));
         assert!(c.get(1).is_none(), "entry past TTL must miss");
     }
@@ -294,7 +308,7 @@ mod tests {
     #[test]
     fn entry_within_ttl_hits() {
         let mut c = cache(500);
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         c.clock.advance(Duration::from_millis(499));
         assert!(c.get(1).is_some(), "entry inside TTL must hit");
     }
@@ -302,7 +316,7 @@ mod tests {
     #[test]
     fn invalidate_drops_entry() {
         let mut c = cache(500);
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         c.invalidate(1);
         assert!(c.get(1).is_none());
     }
@@ -317,8 +331,8 @@ mod tests {
     #[test]
     fn clear_empties_cache() {
         let mut c = cache(500);
-        c.insert(1, vec![fake_element(1)]);
-        c.insert(2, vec![fake_element(2)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
+        c.insert(2, arc_of(vec![fake_element(2)]));
         c.clear();
         assert!(c.is_empty());
     }
@@ -327,7 +341,7 @@ mod tests {
     fn disabled_cache_misses_everything() {
         let mut c: CacheManager<MockClock> =
             CacheManager::with_clock(500, false, MockClock::new());
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         assert!(c.get(1).is_none());
         assert_eq!(c.len(), 0, "insert should be a no-op when disabled");
     }
@@ -335,7 +349,7 @@ mod tests {
     #[test]
     fn reconfigure_disabling_clears_entries() {
         let mut c = cache(500);
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         c.reconfigure(500, false);
         assert!(c.is_empty());
         assert!(!c.is_enabled());
@@ -344,9 +358,9 @@ mod tests {
     #[test]
     fn sweep_evicts_stale_keeps_fresh() {
         let mut c = cache(100);
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         c.clock.advance(Duration::from_millis(150));
-        c.insert(2, vec![fake_element(2)]);
+        c.insert(2, arc_of(vec![fake_element(2)]));
         c.sweep();
         assert!(c.get(1).is_none(), "stale entry should be swept");
         assert!(c.get(2).is_some(), "fresh entry should survive sweep");
@@ -355,9 +369,21 @@ mod tests {
     #[test]
     fn get_evicts_stale_lazily() {
         let mut c = cache(100);
-        c.insert(1, vec![fake_element(1)]);
+        c.insert(1, arc_of(vec![fake_element(1)]));
         c.clock.advance(Duration::from_millis(150));
         let _ = c.get(1);
         assert_eq!(c.len(), 0, "stale entry should be evicted by get()");
+    }
+
+    #[test]
+    fn cache_hit_is_refcount_bump_not_clone() {
+        let mut c = cache(500);
+        let original = arc_of(vec![fake_element(1), fake_element(2)]);
+        c.insert(1, Arc::clone(&original));
+        let got = c.get(1).expect("fresh entry should hit");
+        assert!(
+            Arc::ptr_eq(&got, &original),
+            "cache hit must hand back the same allocation"
+        );
     }
 }

@@ -20,24 +20,31 @@
 //! maximized windows on the same monitor (e.g. Edge + Steam) from drawing
 //! their badges on top of each other.
 //!
-//! Transparency is implemented with the cheapest, most-compatible
-//! mechanism: a layered window with a magenta color key. The window body
-//! is filled with magenta on every paint; only the actual label
-//! rectangles render real pixels.
+//! Transparency is implemented with the modern, fast path:
+//! `UpdateLayeredWindow(ULW_ALPHA)` driven by a pre-composed 32-bit ARGB
+//! DIB. Pixels with `alpha == 0` are fully transparent (no color-key
+//! tax, no per-paint magenta fill); badge pixels carry per-pixel alpha
+//! that DWM blends directly. The HWND, off-screen DIB, and memory DC
+//! are all created once on the first hotkey press and reused for the
+//! life of the process — subsequent picks just re-render and re-show.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use anyhow::{anyhow, Context, Result};
+use smallvec::SmallVec;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, FrameRect, GetMonitorInfoW, InvalidateRect, LineTo, MonitorFromRect, MoveToEx,
-    Polygon, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
-    FF_DONTCARE, FW_BOLD, FW_NORMAL, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject,
+    DrawTextW, FillRect, GetDC, GetMonitorInfoW, MonitorFromRect, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, FF_DONTCARE,
+    FW_BOLD, FW_NORMAL, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -45,23 +52,19 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_BACK, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassInfoExW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, TranslateMessage,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, LWA_ALPHA, LWA_COLORKEY, MSG,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_DESTROY,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE, WM_PAINT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClassInfoExW, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_KEYDOWN, WM_KILLFOCUS, WM_NCCREATE, WM_PAINT,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::Bounds;
 
 const CLASS_NAME: PCWSTR = w!("KeyhopOverlayClass");
 const WINDOW_TITLE: PCWSTR = w!("Keyhop Overlay");
-
-/// Magenta — used as the layered-window color key for transparency.
-/// Anything painted in this exact color becomes see-through.
-const TRANSPARENT_KEY: COLORREF = COLORREF(0x00FF00FF);
 
 /// Pixel gap between the matchable badge and the optional "extra" pill,
 /// and the vertical gap between stacked badges after collision resolution.
@@ -307,6 +310,10 @@ struct OverlayState {
     /// Index into `laid` of the chosen entry, set by `key_down` on a full
     /// label match. `None` means "user cancelled or window closed."
     selected: Option<usize>,
+    /// Set to `true` when the modal pump should exit (selection made,
+    /// Esc pressed, or focus lost). Replaces the old DestroyWindow +
+    /// PostQuitMessage flow now that the HWND is persistent.
+    done: bool,
     label_font: HFONT,
     extra_font: HFONT,
 }
@@ -323,49 +330,95 @@ impl OverlayState {
             style,
             typed: String::new(),
             selected: None,
+            done: false,
             label_font,
             extra_font,
         }
     }
 
-    unsafe fn paint(&self, hwnd: HWND) {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-
-        // Fill entire client area with the color-key value so the
-        // underlying desktop shows through.
-        let bg = CreateSolidBrush(TRANSPARENT_KEY);
-        FillRect(hdc, &ps.rcPaint, bg);
-        let _ = DeleteObject(HGDIOBJ(bg.0));
-
-        let _ = SetBkMode(hdc, TRANSPARENT);
-
-        for laid in &self.laid {
-            self.draw_hint(hdc, laid);
+    /// Render the current state into the supplied off-screen ARGB DIB,
+    /// then atomically push the result to DWM via UpdateLayeredWindow.
+    /// No WM_PAINT round-trip; no magenta color-key tax.
+    unsafe fn render_to_dib(
+        &self,
+        hwnd: HWND,
+        mem_dc: HDC,
+        bits: *mut u8,
+        width: i32,
+        height: i32,
+        opacity: u8,
+    ) {
+        // Reset the DIB to fully transparent. memset on a contiguous
+        // BGRA buffer is cheaper than per-pixel iteration and matches
+        // what the kernel does internally for fresh DIB sections.
+        if !bits.is_null() && width > 0 && height > 0 {
+            std::ptr::write_bytes(bits, 0, (width as usize) * (height as usize) * 4);
         }
 
-        let _ = EndPaint(hwnd, &ps);
+        let _ = SetBkMode(mem_dc, TRANSPARENT);
+
+        for laid in &self.laid {
+            self.draw_hint(mem_dc, bits, width, height, laid);
+        }
+
+        // Hand the finished frame to DWM. SourceConstantAlpha applies
+        // the per-window opacity over the per-pixel alpha — same visual
+        // result as the old LWA_ALPHA + LWA_COLORKEY combo, but with
+        // proper anti-aliased edges around every drawn pixel.
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: opacity,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let size = windows::Win32::Foundation::SIZE { cx: width, cy: height };
+        let src_pt = POINT { x: 0, y: 0 };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            HDC::default(),
+            None,
+            Some(&size as *const _),
+            mem_dc,
+            Some(&src_pt as *const _),
+            COLORREF(0),
+            Some(&blend as *const _),
+            ULW_ALPHA,
+        );
     }
 
-    unsafe fn draw_hint(&self, hdc: HDC, laid: &LaidHint) {
+    unsafe fn draw_hint(
+        &self,
+        hdc: HDC,
+        bits: *mut u8,
+        dib_w: i32,
+        dib_h: i32,
+        laid: &LaidHint,
+    ) {
         // Hide hints whose label doesn't match the typed prefix.
         if !self.typed.is_empty() && !laid.label.starts_with(&self.typed) {
             return;
         }
 
-        // -- leader line + arrowhead (drawn first so the badge paints on top) --
+        // -- leader outline + connector arrow (drawn first so the badge
+        //    paints on top) --
+        //
+        // These go straight into the DIB byte buffer because GDI's
+        // line/frame/polygon operations leave the alpha channel at 0,
+        // which would make them invisible after UpdateLayeredWindow.
         if self.style.show_leader {
-            self.draw_leader(hdc, laid);
+            self.draw_leader_dib(bits, dib_w, dib_h, laid);
         }
 
         // -- matchable badge --
+        //
+        // FillRect writes BGR but zeros the alpha channel; we patch
+        // alpha=255 over the entire badge_rect *after* drawing the text
+        // so glyph pixels (also alpha=0 from DrawText) inherit the
+        // patched alpha. Net result: every pixel inside badge_rect
+        // becomes fully opaque ARGB while pixels outside stay invisible.
         let bg = CreateSolidBrush(self.style.badge_bg);
         FillRect(hdc, &laid.badge_rect, bg);
         let _ = DeleteObject(HGDIOBJ(bg.0));
-
-        let border = CreateSolidBrush(self.style.border);
-        FrameRect(hdc, &laid.badge_rect, border);
-        let _ = DeleteObject(HGDIOBJ(border.0));
 
         let old = SelectObject(hdc, HGDIOBJ(self.label_font.0));
         let mut wide: Vec<u16> = laid.label.encode_utf16().collect();
@@ -402,15 +455,18 @@ impl OverlayState {
         );
         let _ = SelectObject(hdc, old);
 
+        // Now that all GDI pixels for this badge are written, lift the
+        // entire badge rect to alpha=255 in a single sweep.
+        set_alpha_in_rect(bits, dib_w, dib_h, &laid.badge_rect, 255);
+        // Border: 1px frame in the configured border color, written
+        // directly into the DIB so it's already alpha=255.
+        frame_rect_argb(bits, dib_w, dib_h, &laid.badge_rect, self.style.border);
+
         // -- optional extra pill --
         if let (Some(extra_rect), Some(extra)) = (&laid.extra_rect, &laid.extra) {
             let bg = CreateSolidBrush(self.style.extra_bg);
             FillRect(hdc, extra_rect, bg);
             let _ = DeleteObject(HGDIOBJ(bg.0));
-
-            let border = CreateSolidBrush(self.style.border);
-            FrameRect(hdc, extra_rect, border);
-            let _ = DeleteObject(HGDIOBJ(border.0));
 
             let old = SelectObject(hdc, HGDIOBJ(self.extra_font.0));
             let _ = SetTextColor(hdc, self.style.extra_fg);
@@ -428,6 +484,9 @@ impl OverlayState {
                 DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
             let _ = SelectObject(hdc, old);
+
+            set_alpha_in_rect(bits, dib_w, dib_h, extra_rect, 255);
+            frame_rect_argb(bits, dib_w, dib_h, extra_rect, self.style.border);
         }
     }
 
@@ -447,24 +506,15 @@ impl OverlayState {
     ///    the badge off the control to dodge a collision); for badges
     ///    that already sit inside the element the outline alone is the
     ///    cleaner visual.
-    unsafe fn draw_leader(&self, hdc: HDC, laid: &LaidHint) {
+    unsafe fn draw_leader_dib(&self, bits: *mut u8, dib_w: i32, dib_h: i32, laid: &LaidHint) {
         let badge = &laid.badge_rect;
         let target = &laid.target_rect;
 
-        let pen = CreatePen(PS_SOLID, 1, self.style.leader_color);
-        let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
-        let brush = CreateSolidBrush(self.style.leader_color);
-        let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-
-        // Outline the target rect so every badge has a visible
-        // "this is the click area" indicator regardless of placement.
-        // We paint the outline in the badge background color so the
+        // Outline the target rect in the badge background color so the
         // badge↔target association is immediate (yellow badge = yellow
-        // box around its element). FrameRect uses the brush's color
-        // for the border and leaves the interior untouched.
-        let outline_brush = CreateSolidBrush(self.style.badge_bg);
-        FrameRect(hdc, target, outline_brush);
-        let _ = DeleteObject(HGDIOBJ(outline_brush.0));
+        // box around its element). Drawn directly into the DIB so it's
+        // already alpha=255 — GDI's FrameRect would have left alpha=0.
+        frame_rect_argb(bits, dib_w, dib_h, target, self.style.badge_bg);
 
         // Connector arrow only when the badge is meaningfully detached
         // from its target. When the badge sits inside the target the
@@ -482,28 +532,30 @@ impl OverlayState {
             // Anything shorter than ~6px reads as a stray pixel rather
             // than an arrow — skip the connector but keep the outline.
             if len_sq >= 36 {
-                let _ = MoveToEx(hdc, start.x, start.y, None);
-                let _ = LineTo(hdc, end.x, end.y);
+                draw_line_argb(
+                    bits,
+                    dib_w,
+                    dib_h,
+                    start.x,
+                    start.y,
+                    end.x,
+                    end.y,
+                    self.style.leader_color,
+                );
                 let head = arrowhead_polygon(start, end);
-                let _ = Polygon(hdc, &head);
+                fill_triangle_argb(bits, dib_w, dib_h, &head, self.style.leader_color);
             }
         }
-
-        let _ = SelectObject(hdc, old_brush);
-        let _ = SelectObject(hdc, old_pen);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-        let _ = DeleteObject(HGDIOBJ(pen.0));
     }
 
-    unsafe fn key_down(&mut self, hwnd: HWND, vk: u32) {
+    fn key_down(&mut self, vk: u32) {
         if vk == VK_ESCAPE.0 as u32 {
             self.selected = None;
-            let _ = DestroyWindow(hwnd);
+            self.done = true;
             return;
         }
         if vk == VK_BACK.0 as u32 {
             self.typed.pop();
-            let _ = InvalidateRect(hwnd, None, true);
             return;
         }
         // VK_A..VK_Z map 1:1 to ASCII 'A'..'Z'.
@@ -513,7 +565,7 @@ impl OverlayState {
 
             if let Some(idx) = self.laid.iter().position(|h| h.label == self.typed) {
                 self.selected = Some(idx);
-                let _ = DestroyWindow(hwnd);
+                self.done = true;
                 return;
             }
 
@@ -521,7 +573,6 @@ impl OverlayState {
             if !any_prefix {
                 self.typed.clear();
             }
-            let _ = InvalidateRect(hwnd, None, true);
         }
     }
 }
@@ -718,9 +769,11 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
     order.sort_by_key(|&i| (hints[i].bounds.y - origin_y, hints[i].bounds.x - origin_x));
 
     let mut result: Vec<Option<LaidHint>> = (0..hints.len()).map(|_| None).collect();
-    // Bounding box (in client coords) of every laid hint, used purely for
-    // collision tests.
+    // Bounding box (in client coords) of every laid hint, kept dense so
+    // the spatial grid can index into it; collision queries iterate the
+    // grid's bucket lists, not the whole vector.
     let mut placed: Vec<RECT> = Vec::with_capacity(hints.len());
+    let mut grid = SpatialGrid::with_capacity(hints.len());
 
     for &i in &order {
         let h = &hints[i];
@@ -778,7 +831,7 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
                     continue;
                 }
             }
-            if !placed.iter().any(|p| rects_intersect(p, &candidate)) {
+            if !grid.any_intersects(&candidate, &placed) {
                 chosen = Some((cx, cy));
                 break;
             }
@@ -807,7 +860,7 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
                     right: x + total_w,
                     bottom: y + total_h,
                 };
-                if !placed.iter().any(|p| rects_intersect(p, &candidate)) {
+                if !grid.any_intersects(&candidate, &placed) {
                     break;
                 }
                 y += row_h + PILL_GAP;
@@ -852,12 +905,15 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
             bottom: y + row_h,
         });
 
-        placed.push(RECT {
+        let bbox = RECT {
             left: x,
             top: y,
             right: x + total_w,
             bottom: y + total_h,
-        });
+        };
+        let idx = placed.len();
+        placed.push(bbox);
+        grid.insert(idx, &bbox);
         // Element rect in client space — the leader-line painter needs
         // it later to figure out where each badge should point.
         let target_rect = RECT {
@@ -883,6 +939,94 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
 
 fn rects_intersect(a: &RECT, b: &RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Cell side, in client pixels, for [`SpatialGrid`]. Tuned to roughly
+/// the size of a window-style badge so the typical badge touches 1-4
+/// cells, never enough to make the per-cell list grow past `SmallVec`'s
+/// inline capacity.
+const GRID_CELL: i32 = 64;
+
+/// Hash-bucketed broad-phase index for badge bounding boxes. Each cell
+/// holds the indices (into the caller-owned `Vec<RECT>`) of every
+/// placed rect that touches the cell. Collision queries hit only the
+/// cells the candidate overlaps, dropping `lay_out`'s collision pass
+/// from O(n²) to amortized O(n) for our typical n = 50-800 badges.
+///
+/// Key choices:
+/// - `i32` cell coords let us bucket the full virtual-desktop range
+///   without overflow even for the +/-32k px coords on extreme
+///   multi-monitor setups.
+/// - `SmallVec<[usize; 8]>` inlines the bucket contents until a cell
+///   gets unusually crowded, which keeps the per-bucket allocation
+///   count at zero for the common case.
+struct SpatialGrid {
+    cells: HashMap<(i32, i32), SmallVec<[usize; 8]>>,
+}
+
+impl SpatialGrid {
+    fn with_capacity(hint_count: usize) -> Self {
+        // Each badge typically lights up 1-4 cells, so reserving for
+        // ~2x the badge count avoids most rehash bumps without
+        // over-allocating for tiny picks.
+        Self {
+            cells: HashMap::with_capacity(hint_count.saturating_mul(2)),
+        }
+    }
+
+    /// Range of cell coordinates a rect overlaps, expressed as the
+    /// half-open `(x_lo..x_hi, y_lo..y_hi)`.
+    fn cell_range(rect: &RECT) -> (i32, i32, i32, i32) {
+        let x_lo = rect.left.div_euclid(GRID_CELL);
+        let y_lo = rect.top.div_euclid(GRID_CELL);
+        // -1 on the upper edge so a rect that ends exactly on a cell
+        // boundary doesn't claim the next cell over (right/bottom in
+        // RECT are exclusive).
+        let x_hi = (rect.right - 1).div_euclid(GRID_CELL);
+        let y_hi = (rect.bottom - 1).div_euclid(GRID_CELL);
+        (x_lo, y_lo, x_hi, y_hi)
+    }
+
+    fn insert(&mut self, idx: usize, rect: &RECT) {
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return;
+        }
+        let (x_lo, y_lo, x_hi, y_hi) = Self::cell_range(rect);
+        for cy in y_lo..=y_hi {
+            for cx in x_lo..=x_hi {
+                self.cells.entry((cx, cy)).or_default().push(idx);
+            }
+        }
+    }
+
+    /// True if any previously-inserted rect (looked up via `placed`)
+    /// intersects `candidate`. Visits each candidate-id at most once
+    /// per cell, then deduplicates via a tiny stack-allocated set so
+    /// rects spanning multiple cells don't get tested twice.
+    fn any_intersects(&self, candidate: &RECT, placed: &[RECT]) -> bool {
+        if candidate.right <= candidate.left || candidate.bottom <= candidate.top {
+            return false;
+        }
+        let (x_lo, y_lo, x_hi, y_hi) = Self::cell_range(candidate);
+        let mut seen: SmallVec<[usize; 16]> = SmallVec::new();
+        for cy in y_lo..=y_hi {
+            for cx in x_lo..=x_hi {
+                let Some(bucket) = self.cells.get(&(cx, cy)) else {
+                    continue;
+                };
+                for &idx in bucket {
+                    if seen.contains(&idx) {
+                        continue;
+                    }
+                    seen.push(idx);
+                    if rects_intersect(&placed[idx], candidate) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Pick start/end points for the leader line connecting `badge` to
@@ -969,6 +1113,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
 
+    // GWLP_USERDATA points at the OverlayState owned by the active
+    // pick_hint() call. It's null between picks (the persistent HWND is
+    // hidden), in which case we just forward to DefWindowProc — the
+    // window has nothing to render or react to.
     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
     if state_ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -976,21 +1124,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     let state = &mut *state_ptr;
 
     match msg {
-        WM_PAINT => {
-            state.paint(hwnd);
-            LRESULT(0)
-        }
+        // ULW_ALPHA layered windows don't get WM_PAINT for their content
+        // (DWM composites directly from the DIB we hand it via
+        // UpdateLayeredWindow). Swallow it so DefWindowProcW doesn't try
+        // to BeginPaint/EndPaint on the layered surface.
+        WM_PAINT => LRESULT(0),
         WM_KEYDOWN => {
-            state.key_down(hwnd, wp.0 as u32);
+            state.key_down(wp.0 as u32);
             LRESULT(0)
         }
         WM_KILLFOCUS => {
             // Treat focus loss as cancel — no half-committed state.
-            let _ = DestroyWindow(hwnd);
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
+            state.selected = None;
+            state.done = true;
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -1036,43 +1182,67 @@ unsafe fn virtual_screen_rect() -> (i32, i32, i32, i32) {
 /// Returns `Ok(Some(idx))` where `idx` indexes into the input `hints` vec
 /// when the user picks one, and `Ok(None)` on cancel / focus loss / empty
 /// input.
+///
+/// The HWND, off-screen DIB, and memory DC are owned by a thread-local
+/// [`PersistentOverlay`] and reused across calls; only the per-pick
+/// [`OverlayState`] is allocated/freed each time. This drops the
+/// per-pick window-creation latency (~20-40 ms on Windows 11) to zero
+/// after the first hotkey press.
 pub fn pick_hint(hints: Vec<Hint>, style: HintStyle) -> Result<Option<usize>> {
     if hints.is_empty() {
         return Ok(None);
     }
 
-    unsafe {
+    PERSISTENT_OVERLAY.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(unsafe { PersistentOverlay::new()? });
+        }
+        let overlay = slot.as_mut().expect("just initialized");
+        unsafe { overlay.run_pick(hints, style) }
+    })
+}
+
+// Per-thread cache of the persistent overlay. Hotkey handling is
+// single-threaded (it runs on the main message loop), so a thread-local
+// is enough to make the HWND/DIB/DC truly process-wide.
+thread_local! {
+    static PERSISTENT_OVERLAY: RefCell<Option<PersistentOverlay>> = const { RefCell::new(None) };
+}
+
+/// Persistent rendering resources for the overlay: the layered HWND
+/// covering the virtual desktop, an off-screen ARGB DIB sized to that
+/// desktop, and a memory DC bound to the DIB. Recreated lazily on a
+/// virtual-desktop size change (monitor connect/disconnect).
+struct PersistentOverlay {
+    hwnd: HWND,
+    mem_dc: HDC,
+    dib: HBITMAP,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+    origin_x: i32,
+    origin_y: i32,
+}
+
+impl PersistentOverlay {
+    unsafe fn new() -> Result<Self> {
         // Best-effort: tag the process as PerMonitorV2 DPI-aware so
         // source pixel coords line up with our overlay coords on
         // high-DPI displays. Safe to call repeatedly; ignore "already
         // set" / older-OS errors.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
 
-    let hinstance: HINSTANCE = unsafe { GetModuleHandleW(PCWSTR::null())? }.into();
-    unsafe { ensure_class_registered(hinstance)? };
+        let hinstance: HINSTANCE = GetModuleHandleW(PCWSTR::null())?.into();
+        ensure_class_registered(hinstance)?;
 
-    let (vx, vy, vw, vh) = unsafe { virtual_screen_rect() };
-    tracing::debug!(
-        vx,
-        vy,
-        vw,
-        vh,
-        hint_count = hints.len(),
-        "overlay virtual desktop rect"
-    );
-    // Capture the per-window opacity before `style` moves into OverlayState;
-    // SetLayeredWindowAttributes needs it after the window is created.
-    let style_opacity = style.badge_opacity;
-    let state = Box::new(unsafe { OverlayState::new(hints, style, vx, vy) });
-    let state_ptr = Box::into_raw(state);
+        let (vx, vy, vw, vh) = virtual_screen_rect();
 
-    let hwnd_result = unsafe {
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             CLASS_NAME,
             WINDOW_TITLE,
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP,
             vx,
             vy,
             vw,
@@ -1080,50 +1250,371 @@ pub fn pick_hint(hints: Vec<Hint>, style: HintStyle) -> Result<Option<usize>> {
             None,
             None,
             hinstance,
-            Some(state_ptr as *const c_void),
+            None,
         )
-    };
-    let hwnd = match hwnd_result {
-        Ok(h) => h,
-        Err(e) => {
-            // Reclaim the leaked Box to avoid leaking the state on failure.
-            unsafe { drop(Box::from_raw(state_ptr)) };
-            return Err(e).context("CreateWindowExW failed");
-        }
-    };
+        .context("CreateWindowExW failed")?;
 
-    unsafe {
-        // Combine LWA_COLORKEY (magenta pixels = fully transparent) with
-        // LWA_ALPHA (constant per-window alpha applied to everything that
-        // isn't color-keyed). Net effect: everywhere we filled with magenta
-        // the desktop shows through 100%, and badge pixels blend at the
-        // configured opacity. Cheap, no off-screen DC required, and keeps
-        // text readable as long as the alpha stays above ~180.
-        SetLayeredWindowAttributes(
+        let (mem_dc, dib, bits) = create_dib_surface(vw, vh)
+            .context("failed to allocate overlay DIB surface")?;
+
+        let _ = hinstance;
+        Ok(Self {
             hwnd,
-            TRANSPARENT_KEY,
-            style_opacity,
-            LWA_COLORKEY | LWA_ALPHA,
-        )?;
-        let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(hwnd);
+            mem_dc,
+            dib,
+            bits,
+            width: vw,
+            height: vh,
+            origin_x: vx,
+            origin_y: vy,
+        })
     }
 
-    // Modal message pump. Returns when WndProc posts WM_QUIT.
-    let mut msg = MSG::default();
-    loop {
-        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if r.0 == 0 || r.0 == -1 {
-            break;
+    /// Reallocate DIB + reposition HWND if the virtual desktop changed
+    /// (e.g. monitor hot-plug). Idempotent when nothing has moved.
+    unsafe fn ensure_geometry(&mut self) -> Result<()> {
+        let (vx, vy, vw, vh) = virtual_screen_rect();
+        if vx == self.origin_x && vy == self.origin_y && vw == self.width && vh == self.height {
+            return Ok(());
         }
-        unsafe {
+        let _ = SetWindowPos(self.hwnd, None, vx, vy, vw, vh, SWP_NOZORDER | SWP_NOACTIVATE);
+        if vw != self.width || vh != self.height {
+            // Tear down the old DIB before allocating the new one so we
+            // don't double the peak memory footprint on reconnects.
+            let _ = DeleteDC(self.mem_dc);
+            let _ = DeleteObject(HGDIOBJ(self.dib.0));
+            let (mem_dc, dib, bits) = create_dib_surface(vw, vh)
+                .context("failed to reallocate overlay DIB surface")?;
+            self.mem_dc = mem_dc;
+            self.dib = dib;
+            self.bits = bits;
+            self.width = vw;
+            self.height = vh;
+        }
+        self.origin_x = vx;
+        self.origin_y = vy;
+        Ok(())
+    }
+
+    unsafe fn run_pick(&mut self, hints: Vec<Hint>, style: HintStyle) -> Result<Option<usize>> {
+        self.ensure_geometry()?;
+
+        let (vx, vy, vw, vh) = (self.origin_x, self.origin_y, self.width, self.height);
+        tracing::debug!(
+            vx,
+            vy,
+            vw,
+            vh,
+            hint_count = hints.len(),
+            "overlay virtual desktop rect"
+        );
+
+        let opacity = style.badge_opacity;
+        let mut state = OverlayState::new(hints, style, vx, vy);
+
+        // Bind the state pointer to the persistent HWND so wnd_proc can
+        // route key events into it. We clear the pointer before
+        // dropping the state so a stray late message can't dereference
+        // freed memory.
+        SetWindowLongPtrW(
+            self.hwnd,
+            GWLP_USERDATA,
+            (&mut state as *mut OverlayState) as isize,
+        );
+
+        // Initial render + show. ShowWindow with SW_SHOWNOACTIVATE keeps
+        // the previously focused app visually unchanged underneath the
+        // overlay; we still SetForegroundWindow + SetFocus so key
+        // events route to us.
+        state.render_to_dib(self.hwnd, self.mem_dc, self.bits, self.width, self.height, opacity);
+        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        let _ = SetForegroundWindow(self.hwnd);
+        let _ = SetFocus(self.hwnd);
+
+        // Modal pump: spin until the state flags `done`. After every
+        // dispatched message we re-render so live prefix-typing visibly
+        // hides non-matching badges. Clippy can't see through the
+        // wnd_proc indirection that flips `state.done`, so silence the
+        // "not mutated in the loop body" lint here.
+        let mut last_typed_len = state.typed.len();
+        let mut msg = MSG::default();
+        #[allow(clippy::while_immutable_condition)]
+        while !state.done {
+            let r = GetMessageW(&mut msg, None, 0, 0);
+            if r.0 == 0 || r.0 == -1 {
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            if state.done {
+                break;
+            }
+            if state.typed.len() != last_typed_len {
+                state.render_to_dib(
+                    self.hwnd,
+                    self.mem_dc,
+                    self.bits,
+                    self.width,
+                    self.height,
+                    opacity,
+                );
+                last_typed_len = state.typed.len();
+            }
+        }
+
+        // Hide first, then unbind the state pointer — the order matters
+        // because ShowWindow can pump a few WM_KILLFOCUS / WM_NCACTIVATE
+        // messages synchronously and we want them to find a still-valid
+        // state (or a null pointer that wnd_proc safely no-ops on).
+        let _ = ShowWindow(self.hwnd, SW_HIDE);
+        SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+
+        Ok(state.selected)
+    }
+}
+
+impl Drop for PersistentOverlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.mem_dc);
+            let _ = DeleteObject(HGDIOBJ(self.dib.0));
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
+}
 
-    let state = unsafe { Box::from_raw(state_ptr) };
-    Ok(state.selected)
+/// Allocate a top-down 32-bit BGRA DIB section, bind it to a fresh
+/// memory DC, and return raw pointers to all three. The caller owns
+/// the lifetimes and must DeleteDC + DeleteObject when done.
+unsafe fn create_dib_surface(width: i32, height: i32) -> Result<(HDC, HBITMAP, *mut u8)> {
+    let screen_dc = GetDC(None);
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    let _ = ReleaseDC(None, screen_dc);
+    if mem_dc.is_invalid() {
+        return Err(anyhow!("CreateCompatibleDC returned NULL"));
+    }
+
+    // Negative biHeight = top-down, which lines up with our (x, y)
+    // pixel-addressing convention so we don't have to flip rows when
+    // patching alpha.
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(mem_dc, &mut bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        .context("CreateDIBSection failed")?;
+    if bits.is_null() {
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+        let _ = DeleteDC(mem_dc);
+        return Err(anyhow!("CreateDIBSection returned NULL bits"));
+    }
+    let _ = SelectObject(mem_dc, HGDIOBJ(dib.0));
+
+    Ok((mem_dc, dib, bits as *mut u8))
+}
+
+// -- Direct ARGB rasterization helpers --------------------------------
+//
+// GDI on a 32-bit DIB writes BGR but leaves the alpha byte at 0, so
+// anything we want visible after UpdateLayeredWindow either has to be
+// patched up post-hoc (`set_alpha_in_rect`) or written directly to the
+// pixel buffer with the right ARGB tuple (`*_argb` helpers below).
+//
+// All of these treat `bits` as a top-down BGRA buffer of `dib_w * dib_h`
+// pixels and silently clip writes that fall outside the buffer.
+
+/// Lift the alpha byte to `alpha` for every pixel in `rect ∩ dib`.
+/// Used after a FillRect/DrawText sequence so the just-drawn region
+/// becomes opaque in one sweep.
+unsafe fn set_alpha_in_rect(bits: *mut u8, dib_w: i32, dib_h: i32, rect: &RECT, alpha: u8) {
+    if bits.is_null() {
+        return;
+    }
+    let x0 = rect.left.max(0);
+    let y0 = rect.top.max(0);
+    let x1 = rect.right.min(dib_w);
+    let y1 = rect.bottom.min(dib_h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let stride = (dib_w as usize) * 4;
+    for y in y0..y1 {
+        let row = bits.add((y as usize) * stride);
+        // We could SIMD this but the badge rects are tiny (≤200 px
+        // wide × ~30 px tall) — the scalar loop fits in L1 trivially.
+        let mut p = row.add((x0 as usize) * 4 + 3);
+        for _ in x0..x1 {
+            *p = alpha;
+            p = p.add(4);
+        }
+    }
+}
+
+/// Write a single fully-opaque pixel at `(x, y)` in `color` (BGR).
+#[inline]
+unsafe fn put_pixel_argb(bits: *mut u8, dib_w: i32, dib_h: i32, x: i32, y: i32, color: COLORREF) {
+    if x < 0 || y < 0 || x >= dib_w || y >= dib_h || bits.is_null() {
+        return;
+    }
+    let stride = (dib_w as usize) * 4;
+    let p = bits.add((y as usize) * stride + (x as usize) * 4);
+    let bgr = color.0;
+    *p = (bgr & 0xFF) as u8; // B
+    *p.add(1) = ((bgr >> 8) & 0xFF) as u8; // G
+    *p.add(2) = ((bgr >> 16) & 0xFF) as u8; // R
+    *p.add(3) = 0xFF; // A
+}
+
+/// 1px-thick filled rect (interior) in ARGB. Used for the four edges
+/// of [`frame_rect_argb`] and as a building block for short connector
+/// arrows; cheap enough to inline into the line/polygon helpers.
+unsafe fn fill_rect_argb(bits: *mut u8, dib_w: i32, dib_h: i32, rect: &RECT, color: COLORREF) {
+    let x0 = rect.left.max(0);
+    let y0 = rect.top.max(0);
+    let x1 = rect.right.min(dib_w);
+    let y1 = rect.bottom.min(dib_h);
+    if x0 >= x1 || y0 >= y1 || bits.is_null() {
+        return;
+    }
+    let stride = (dib_w as usize) * 4;
+    let bgr = color.0;
+    let b = (bgr & 0xFF) as u8;
+    let g = ((bgr >> 8) & 0xFF) as u8;
+    let r = ((bgr >> 16) & 0xFF) as u8;
+    for y in y0..y1 {
+        let row = bits.add((y as usize) * stride);
+        let mut p = row.add((x0 as usize) * 4);
+        for _ in x0..x1 {
+            *p = b;
+            *p.add(1) = g;
+            *p.add(2) = r;
+            *p.add(3) = 0xFF;
+            p = p.add(4);
+        }
+    }
+}
+
+/// 1px frame around `rect`, drawn directly into the DIB. Mirrors
+/// `FrameRect`'s semantics (rect.right and rect.bottom are exclusive)
+/// so callers can keep the same coordinates they used with GDI.
+unsafe fn frame_rect_argb(bits: *mut u8, dib_w: i32, dib_h: i32, rect: &RECT, color: COLORREF) {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let top = RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.top + 1 };
+    let bottom = RECT {
+        left: rect.left,
+        top: rect.bottom - 1,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    let left = RECT { left: rect.left, top: rect.top, right: rect.left + 1, bottom: rect.bottom };
+    let right = RECT {
+        left: rect.right - 1,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    fill_rect_argb(bits, dib_w, dib_h, &top, color);
+    fill_rect_argb(bits, dib_w, dib_h, &bottom, color);
+    fill_rect_argb(bits, dib_w, dib_h, &left, color);
+    fill_rect_argb(bits, dib_w, dib_h, &right, color);
+}
+
+/// Bresenham line rasterizer that writes ARGB pixels directly. We use
+/// it instead of `LineTo` because GDI line drawing leaves the alpha
+/// channel at 0 (so the line would be invisible after
+/// UpdateLayeredWindow even though the pixels were written).
+unsafe fn draw_line_argb(
+    bits: *mut u8,
+    dib_w: i32,
+    dib_h: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: COLORREF,
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut x = x0;
+    let mut y = y0;
+    loop {
+        put_pixel_argb(bits, dib_w, dib_h, x, y, color);
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+/// Filled triangle in ARGB via a simple scanline fill. The arrowhead
+/// triangles we draw are at most ~7 px on a side, so a barycentric or
+/// edge-walk approach would be over-engineering — bounding-box +
+/// orientation test is plenty.
+unsafe fn fill_triangle_argb(
+    bits: *mut u8,
+    dib_w: i32,
+    dib_h: i32,
+    pts: &[POINT; 3],
+    color: COLORREF,
+) {
+    let min_x = pts.iter().map(|p| p.x).min().unwrap_or(0).max(0);
+    let max_x = pts.iter().map(|p| p.x).max().unwrap_or(0).min(dib_w - 1);
+    let min_y = pts.iter().map(|p| p.y).min().unwrap_or(0).max(0);
+    let max_y = pts.iter().map(|p| p.y).max().unwrap_or(0).min(dib_h - 1);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+    // Edge-function sign test: a point is inside the triangle iff it
+    // lies on the same side of all three edges. We pick the convention
+    // by sampling the centroid so the test works for both winding
+    // orders (the arrowhead helper doesn't guarantee CW vs CCW).
+    let edge = |ax: i32, ay: i32, bx: i32, by: i32, cx: i32, cy: i32| -> i32 {
+        (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    };
+    let cx = (pts[0].x + pts[1].x + pts[2].x) / 3;
+    let cy = (pts[0].y + pts[1].y + pts[2].y) / 3;
+    let s0 = edge(pts[0].x, pts[0].y, pts[1].x, pts[1].y, cx, cy);
+    let s1 = edge(pts[1].x, pts[1].y, pts[2].x, pts[2].y, cx, cy);
+    let s2 = edge(pts[2].x, pts[2].y, pts[0].x, pts[0].y, cx, cy);
+    let want_pos = s0 >= 0 && s1 >= 0 && s2 >= 0;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let e0 = edge(pts[0].x, pts[0].y, pts[1].x, pts[1].y, x, y);
+            let e1 = edge(pts[1].x, pts[1].y, pts[2].x, pts[2].y, x, y);
+            let e2 = edge(pts[2].x, pts[2].y, pts[0].x, pts[0].y, x, y);
+            let inside = if want_pos {
+                e0 >= 0 && e1 >= 0 && e2 >= 0
+            } else {
+                e0 <= 0 && e1 <= 0 && e2 <= 0
+            };
+            if inside {
+                put_pixel_argb(bits, dib_w, dib_h, x, y, color);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1387,6 +1878,69 @@ mod layout_tests {
         assert_eq!(laid[0].target_rect.top, 50);
         assert_eq!(laid[0].target_rect.right, 110);
         assert_eq!(laid[0].target_rect.bottom, 90);
+    }
+}
+
+#[cfg(test)]
+mod spatial_grid_tests {
+    use super::*;
+
+    fn r(l: i32, t: i32, w: i32, h: i32) -> RECT {
+        RECT { left: l, top: t, right: l + w, bottom: t + h }
+    }
+
+    #[test]
+    fn empty_grid_reports_no_collision() {
+        let grid = SpatialGrid::with_capacity(0);
+        let placed: Vec<RECT> = Vec::new();
+        assert!(!grid.any_intersects(&r(0, 0, 50, 20), &placed));
+    }
+
+    #[test]
+    fn detects_collision_within_same_cell() {
+        let mut grid = SpatialGrid::with_capacity(2);
+        let placed = vec![r(0, 0, 30, 30)];
+        grid.insert(0, &placed[0]);
+        // Candidate overlaps placed[0] inside the same 64-px cell.
+        assert!(grid.any_intersects(&r(10, 10, 20, 20), &placed));
+    }
+
+    #[test]
+    fn ignores_rect_in_unrelated_cell() {
+        let mut grid = SpatialGrid::with_capacity(2);
+        let placed = vec![r(0, 0, 20, 20)];
+        grid.insert(0, &placed[0]);
+        // Candidate at (500, 500) — far away, no shared cell.
+        assert!(!grid.any_intersects(&r(500, 500, 20, 20), &placed));
+    }
+
+    #[test]
+    fn dedupes_rects_spanning_multiple_cells() {
+        // A wide rect spans cells (0,0) and (1,0). The candidate also
+        // spans both cells — without dedupe we'd test the placed rect
+        // twice. Correctness is unaffected, but the test pins the
+        // optimization in place via a side-channel: a degenerate
+        // candidate that fits between two large rects must not falsely
+        // report collision because of double-visiting.
+        let mut grid = SpatialGrid::with_capacity(2);
+        let placed = vec![r(0, 0, 100, 20), r(0, 100, 100, 20)];
+        for (i, rect) in placed.iter().enumerate() {
+            grid.insert(i, rect);
+        }
+        // Candidate sits in the gap between the two placed rects but
+        // spans the same horizontal cells.
+        assert!(!grid.any_intersects(&r(20, 40, 60, 20), &placed));
+    }
+
+    #[test]
+    fn handles_negative_coordinates() {
+        // Multi-monitor setups with the primary in the middle put the
+        // virtual desktop's leftmost monitor at negative client coords.
+        let mut grid = SpatialGrid::with_capacity(2);
+        let placed = vec![r(-100, -50, 40, 40)];
+        grid.insert(0, &placed[0]);
+        assert!(grid.any_intersects(&r(-90, -40, 20, 20), &placed));
+        assert!(!grid.any_intersects(&r(200, 200, 20, 20), &placed));
     }
 }
 

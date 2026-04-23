@@ -214,6 +214,22 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         config.scope.max_elements,
     )?;
 
+    // Phase 4: spin up the foreground-tracking pre-warm worker so the
+    // hotkey path can serve from a hot cache. Held in a binding whose
+    // `Drop` unhooks `SetWinEventHook` on shutdown. Failure is
+    // non-fatal: the synchronous hotkey path still works, just with
+    // cold-cache UIA latency on each press.
+    let _prewarm = match keyhop::windows::prewarm::Prewarmer::start(
+        backend.cache_handle(),
+        config.scope.max_elements,
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = ?e, "prewarm worker unavailable; hotkeys will run cold");
+            None
+        }
+    };
+
     // Register hotkeys from config. Conflicts (e.g. another app already
     // owns the chord) are surfaced to the user but don't abort startup —
     // partial registration is better than nothing, and the user can fix
@@ -281,11 +297,11 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     println!();
     println!("Switch focus to any app, then press a leader.");
 
-    // Keep the splash visible for at least 3s so the user actually sees
+    // Keep the splash visible for at least 2.5s so the user actually sees
     // the brand mark on fast machines where init completes in <100ms.
     // Pump messages while we wait so the splash stays painted.
     if splash.is_some() {
-        const MIN_SPLASH_MS: u128 = 3000;
+        const MIN_SPLASH_MS: u128 = 2500;
         let elapsed = splash_shown_at.elapsed().as_millis();
         if elapsed < MIN_SPLASH_MS {
             let remaining = MIN_SPLASH_MS - elapsed;
