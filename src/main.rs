@@ -16,6 +16,8 @@
 use std::process::ExitCode;
 
 use keyhop::{Action, Backend, Config, Element, HintEngine};
+#[cfg(windows)]
+use keyhop::config::ScopeMode;
 
 #[cfg(windows)]
 use keyhop::windows::{
@@ -180,11 +182,21 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     };
 
     let config = Config::load_or_default();
-    let hint_engine = HintEngine::new(&config.hints.alphabet);
+    // Resolve the alphabet from the preset + flags every launch so users
+    // who hand-edit `[hints]` to switch presets don't have to delete the
+    // stale `alphabet` field by hand. Settings dialog Save also writes
+    // a resolved value, so this is just defence-in-depth.
+    let resolved_alphabet = keyhop::alphabet_presets::build_alphabet(&config.hints);
+    let hint_engine = keyhop::HintEngine::with_strategy(&resolved_alphabet, config.hints.strategy)
+        .with_min_singles(config.hints.min_singles);
     let element_style = HintStyle::elements_from_config(&config.colors.element);
     let window_style = HintStyle::windows_from_config(&config.colors.window);
 
-    let mut backend = keyhop::windows::WindowsBackend::new()?;
+    let mut backend = keyhop::windows::WindowsBackend::with_config(
+        config.performance.enable_caching,
+        config.performance.cache_ttl_ms,
+        config.scope.max_elements,
+    )?;
 
     // Register hotkeys from config. Conflicts (e.g. another app already
     // owns the chord) are surfaced to the user but don't abort startup —
@@ -253,6 +265,7 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         hint_engine,
         element_style,
         window_style,
+        scope_mode: config.scope.mode,
     };
 
     // Win32 message loop. `GetMessageW` is required on this thread for the
@@ -349,6 +362,10 @@ struct Runtime {
     hint_engine: HintEngine,
     element_style: HintStyle,
     window_style: HintStyle,
+    /// Which set of windows the element picker enumerates. Driven by
+    /// `[scope]` in `config.toml`; defaults to active-window for
+    /// backwards-compatible v0.3.0 behaviour.
+    scope_mode: ScopeMode,
 }
 
 #[cfg(windows)]
@@ -368,7 +385,7 @@ fn handle_pick_element(
     backend: &mut keyhop::windows::WindowsBackend,
     runtime: &Runtime,
 ) -> anyhow::Result<()> {
-    let elements: Vec<Element> = backend.enumerate_foreground()?;
+    let elements: Vec<Element> = backend.enumerate_by_scope(runtime.scope_mode)?;
     if elements.is_empty() {
         tracing::info!("no interactable elements in foreground window");
         notification::info(

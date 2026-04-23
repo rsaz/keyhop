@@ -7,12 +7,14 @@
 //! change in behavior.
 //!
 //! All user-facing customization (hotkeys, hint alphabet, overlay colors,
-//! Windows startup) flows through this single struct so the Settings window
-//! has exactly one round-trip target.
+//! Windows startup, scope, performance) flows through this single struct
+//! so the Settings window has exactly one round-trip target.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::hint::HintStrategy;
 
 /// Top-level configuration loaded from `config.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +28,10 @@ pub struct Config {
     pub colors: ColorConfig,
     /// Windows startup integration (write to Run registry key).
     pub startup: StartupConfig,
+    /// Element-targeting scope (active window vs all monitors etc.).
+    pub scope: ScopeConfig,
+    /// Performance toggles (caching).
+    pub performance: PerformanceConfig,
 }
 
 /// Hotkey chord strings (parsed by [`crate::windows::hotkey::parse_hotkey`]).
@@ -52,15 +58,100 @@ impl Default for HotkeyBindings {
 #[serde(default)]
 pub struct HintConfig {
     /// Characters used to build hint labels. Default: home row `asdfghjkl`.
+    /// When empty (and a `preset` is set), the alphabet is derived from
+    /// the preset/builder fields below.
     pub alphabet: String,
+    /// Allocation strategy. Default: [`HintStrategy::ShortestFirst`].
+    pub strategy: HintStrategy,
+    /// Built-in alphabet preset selected from a small menu in Settings.
+    /// When set to anything other than [`AlphabetPreset::Custom`] the
+    /// `alphabet` field is rebuilt from this preset plus the modifier
+    /// flags below on Save.
+    pub preset: AlphabetPreset,
+    /// Append the digits `0123456789` to the preset alphabet.
+    pub include_numbers: bool,
+    /// Append the right-hand extension keys `;'` to the preset alphabet.
+    pub include_extended: bool,
+    /// Strip ambiguous characters (`I`, `l`, `O`, `0`) from the final
+    /// alphabet so the user can't confuse them on a busy overlay.
+    pub exclude_ambiguous: bool,
+    /// Free-form characters appended to the preset alphabet. Useful for
+    /// keyboard layouts with handy non-ASCII keys (e.g. dead keys on
+    /// AZERTY) that would otherwise be unreachable.
+    pub custom_additions: String,
+    /// Minimum number of single-character hints to *guarantee* on every
+    /// scene, even when math-optimal allocation would skip them.
+    ///
+    /// When a scene has many targets (e.g. > 73 with the 9-char home
+    /// row), the Vimium-style allocator skips length-1 hints because
+    /// promoting one would force `n` length-`L` hints to grow by one
+    /// character — net cost across the scene is higher. That's
+    /// average-keystroke optimal but ergonomically surprising: users
+    /// expect "shortest first" to mean "at least one single-key hint".
+    ///
+    /// Setting this to a positive number reserves that many length-1
+    /// hints from `alphabet[0..min_singles]`, then runs the Vimium
+    /// allocator over the remaining `n − min_singles` prefix slots for
+    /// the rest of the count. Trades a small average-typing penalty
+    /// for guaranteed one-key reach on the most-likely targets.
+    ///
+    /// Capped at `n − 1` at runtime (we always leave at least one
+    /// prefix slot for multi-char hints when count > n). Default `8`
+    /// matches the home-row alphabet's "all letters as singles, last
+    /// one reserved as prefix" convention that vim-style hint tools
+    /// (Vimium, Surfingkeys, easymotion) ship with — set to `0` to
+    /// fall back to the math-optimal Vimium allocation that
+    /// minimises average keystrokes at the cost of one-key reach.
+    #[serde(default = "default_min_singles")]
+    pub min_singles: usize,
+}
+
+/// Default for [`HintConfig::min_singles`]. Lifted to a free function so
+/// `#[serde(default = "...")]` can call it on a per-field basis when
+/// the user's `config.toml` is missing the entry — important because
+/// users upgrading from earlier [Unreleased] builds where the default
+/// was `0` would otherwise lose the new behaviour silently.
+fn default_min_singles() -> usize {
+    8
 }
 
 impl Default for HintConfig {
     fn default() -> Self {
         Self {
             alphabet: crate::hint::DEFAULT_ALPHABET.to_string(),
+            strategy: HintStrategy::default(),
+            preset: AlphabetPreset::default(),
+            include_numbers: false,
+            include_extended: false,
+            exclude_ambiguous: true,
+            custom_additions: String::new(),
+            min_singles: default_min_singles(),
         }
     }
+}
+
+/// Pre-built alphabet templates the Settings dialog exposes via a
+/// dropdown. Mapping to actual characters lives in
+/// [`crate::alphabet_presets`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AlphabetPreset {
+    /// Home row (`asdfghjkl`). Default — minimum hand movement.
+    #[default]
+    HomeRow,
+    /// Home row plus right-hand extension keys (`asdfghjkl;'`).
+    HomeRowExtended,
+    /// Lowercase a-z.
+    LowercaseAlpha,
+    /// Lowercase a-z plus 0-9.
+    Alphanumeric,
+    /// Top-row digits 0-9.
+    Numbers,
+    /// Don't apply any preset — use the `alphabet` field verbatim. The
+    /// modifier flags (`include_numbers`, `exclude_ambiguous`, …) are
+    /// also ignored in this mode so power-users get exactly what they
+    /// typed.
+    Custom,
 }
 
 /// Overlay color presets for both pickers.
@@ -108,6 +199,68 @@ pub struct StartupConfig {
     /// window mirrors this back to the registry on Save; the in-process
     /// flag is here so we have a single source of truth for the UI.
     pub launch_at_startup: bool,
+}
+
+/// Element-targeting scope. Picks which set of windows the element
+/// picker enumerates when the user fires its leader chord.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ScopeConfig {
+    /// Scope mode. See [`ScopeMode`].
+    pub mode: ScopeMode,
+    /// Hard cap on elements collected per enumeration, applied across
+    /// the entire scope. Prevents "all windows" mode on a busy desktop
+    /// from producing a wall of badges that can't be parsed visually.
+    pub max_elements: usize,
+}
+
+impl Default for ScopeConfig {
+    fn default() -> Self {
+        Self {
+            mode: ScopeMode::default(),
+            max_elements: 300,
+        }
+    }
+}
+
+/// Which set of windows the element picker enumerates. Defaults to
+/// [`Self::ActiveWindow`] (the v0.3.0 behaviour) so existing users see
+/// no change after upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeMode {
+    /// Only the foreground window (legacy behaviour).
+    #[default]
+    ActiveWindow,
+    /// All visible top-level windows on the monitor that currently
+    /// contains the cursor.
+    ActiveMonitor,
+    /// All visible top-level windows across every monitor.
+    AllWindows,
+}
+
+/// Performance / caching toggles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PerformanceConfig {
+    /// When `true`, the backend caches enumeration results per HWND for
+    /// `cache_ttl_ms` milliseconds. Repeated invocations on the same
+    /// window (e.g. cancelling and retrying) skip the UIA tree walk
+    /// entirely.
+    pub enable_caching: bool,
+    /// Lifetime of a cache entry in milliseconds. Lower values are
+    /// safer (the UI is less likely to drift from reality) but reduce
+    /// the cache hit rate.
+    pub cache_ttl_ms: u64,
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            enable_caching: true,
+            cache_ttl_ms: 500,
+        }
+    }
 }
 
 impl Config {
@@ -205,11 +358,52 @@ mod tests {
         // Other fields keep their defaults.
         assert_eq!(cfg.hotkeys.pick_window, "Ctrl+Alt+Space");
         assert_eq!(cfg.hints.alphabet, crate::hint::DEFAULT_ALPHABET);
+        assert_eq!(cfg.hints.strategy, HintStrategy::ShortestFirst);
+        assert_eq!(cfg.scope.mode, ScopeMode::ActiveWindow);
+        assert_eq!(cfg.scope.max_elements, 300);
+        assert!(cfg.performance.enable_caching);
+        assert_eq!(cfg.performance.cache_ttl_ms, 500);
     }
 
     #[test]
     fn empty_toml_is_all_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn scope_mode_serializes_as_snake_case() {
+        let cfg = ScopeConfig {
+            mode: ScopeMode::AllWindows,
+            max_elements: 100,
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            text.contains("all_windows"),
+            "expected snake_case in {text:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_scope_or_performance_loads() {
+        // Older config files only had hotkeys, hints, colors, startup.
+        // They must continue to deserialize cleanly into the new struct
+        // — anything missing falls back to defaults.
+        let text = r#"
+            [hotkeys]
+            pick_element = "Ctrl+Shift+Space"
+            pick_window  = "Ctrl+Alt+Space"
+            [hints]
+            alphabet = "asdfghjkl"
+            [colors.element]
+            badge_bg = ""
+            [colors.window]
+            badge_bg = ""
+            [startup]
+            launch_at_startup = false
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.scope, ScopeConfig::default());
+        assert_eq!(cfg.performance, PerformanceConfig::default());
     }
 }

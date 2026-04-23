@@ -33,10 +33,11 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, FrameRect, InvalidateRect, LineTo, MoveToEx, Polygon, SelectObject, SetBkMode,
-    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, FF_DONTCARE, FW_BOLD, FW_NORMAL,
-    HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    FillRect, FrameRect, GetMonitorInfoW, InvalidateRect, LineTo, MonitorFromRect, MoveToEx,
+    Polygon, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP,
+    FF_DONTCARE, FW_BOLD, FW_NORMAL, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -535,6 +536,15 @@ impl Drop for OverlayState {
 }
 
 unsafe fn create_font(height: i32, weight: i32) -> HFONT {
+    // Consolas is a clean monospace font shipped with every supported
+    // Windows version. Critically for the hint overlay it draws lower-case
+    // `l` and capital `I` distinctly (the Segoe UI default we used through
+    // v0.3.0 made the two collapse on small badges, which is one of the
+    // top "I typed the wrong letter" complaints in issue #4).
+    //
+    // CreateFontW silently substitutes the closest available face if
+    // Consolas is missing, so the explicit name is safe even on heavily
+    // customised installs where shell fonts have been replaced.
     CreateFontW(
         height,
         0,
@@ -549,16 +559,19 @@ unsafe fn create_font(height: i32, weight: i32) -> HFONT {
         CLIP_DEFAULT_PRECIS.0.into(),
         CLEARTYPE_QUALITY.0.into(),
         u32::from(DEFAULT_PITCH.0 | (FF_DONTCARE.0 << 4)),
-        w!("Segoe UI"),
+        w!("Consolas"),
     )
 }
 
 /// Anchor strategy for placing a badge relative to its target element.
 ///
 /// We try these in order and pick the first one that doesn't collide with
-/// an already-placed badge. The order is tuned so the layout still *feels*
-/// like "badge sits on the top-left of the thing" most of the time, while
-/// giving us escape hatches when two elements share the same anchor.
+/// an already-placed badge **and** stays inside the source element's
+/// monitor. The order is tuned so the layout still *feels* like "badge
+/// sits on the top-left of the thing" most of the time, while giving us
+/// escape hatches when two elements share the same anchor or when the
+/// element is too close to a monitor edge for the preferred placement
+/// to fit.
 #[derive(Debug, Clone, Copy)]
 enum BadgePosition {
     /// Top-left of the element. The classic vimium/keyhop look — keeps
@@ -568,23 +581,29 @@ enum BadgePosition {
     /// controls would collide (think: two buttons in a toolbar).
     TopRight,
     /// Outside, just above the element. Falls off the element entirely so
-    /// nothing visual is obscured. May land off-screen for elements at
-    /// y == 0; the renderer doesn't validate that, but Windows clips it.
+    /// nothing visual is obscured. Skipped automatically when the element
+    /// is too close to its monitor's top edge.
     OutsideTop,
+    /// Outside, just below the element. The fallback when `OutsideTop`
+    /// would clip off the top of the monitor (or off into the previous
+    /// monitor on multi-monitor setups).
+    OutsideBottom,
     /// Bottom-right of the element. Last "still on the element" option
     /// before we resort to vertical stacking.
     BottomRight,
 }
 
-/// Default candidate order: badge above the element first, then on it.
-/// Used by the element picker — small UI controls benefit from having
-/// the badge offset above them so the user can see what they're about
-/// to invoke before pressing the matching keys.
-const ELEMENT_POSITION_CANDIDATES: [BadgePosition; 4] = [
+/// Default candidate order: badge above the element first, then on it,
+/// then below it as the off-element fallback. Used by the element picker
+/// — small UI controls benefit from having the badge offset above them
+/// so the user can see what they're about to invoke before pressing
+/// the matching keys.
+const ELEMENT_POSITION_CANDIDATES: [BadgePosition; 5] = [
     BadgePosition::OutsideTop,
     BadgePosition::TopLeft,
     BadgePosition::TopRight,
     BadgePosition::BottomRight,
+    BadgePosition::OutsideBottom,
 ];
 
 /// Window-picker candidate order: badge inside the window's top-left
@@ -616,11 +635,57 @@ fn anchor_for(
         BadgePosition::TopLeft => (x_base, y_base),
         BadgePosition::TopRight => (x_base + bounds.width - total_w, y_base),
         BadgePosition::OutsideTop => (x_base, y_base - total_h - PILL_GAP),
+        BadgePosition::OutsideBottom => (x_base, y_base + bounds.height + PILL_GAP),
         BadgePosition::BottomRight => (
             x_base + bounds.width - total_w,
             y_base + bounds.height - total_h,
         ),
     }
+}
+
+/// Bounds of the monitor whose work area contains the most of `bounds`,
+/// in screen-space (physical pixels).
+///
+/// Returns `None` when the monitor query fails — the caller treats that
+/// as "no monitor constraint, place anywhere" rather than refusing to
+/// lay out.
+unsafe fn monitor_for_bounds(bounds: &Bounds) -> Option<RECT> {
+    let rect = RECT {
+        left: bounds.x,
+        top: bounds.y,
+        right: bounds.x + bounds.width,
+        bottom: bounds.y + bounds.height,
+    };
+    let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        return None;
+    }
+    Some(info.rcMonitor)
+}
+
+/// Translate a screen-space `RECT` into the same client-space the
+/// renderer uses (origin = top-left of the virtual desktop).
+fn screen_to_client_rect(rect: RECT, origin_x: i32, origin_y: i32) -> RECT {
+    RECT {
+        left: rect.left - origin_x,
+        top: rect.top - origin_y,
+        right: rect.right - origin_x,
+        bottom: rect.bottom - origin_y,
+    }
+}
+
+/// True when `rect` is fully contained inside `monitor` (in the same
+/// coordinate space). Used during layout to drop candidate positions
+/// that would push the badge off the source element's monitor.
+fn rect_inside_monitor(rect: &RECT, monitor: &RECT) -> bool {
+    rect.left >= monitor.left
+        && rect.top >= monitor.top
+        && rect.right <= monitor.right
+        && rect.bottom <= monitor.bottom
 }
 
 /// Resolve hint anchors into final draw rectangles.
@@ -671,10 +736,23 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
         let total_w = badge_w + extra_w.map(|w| PILL_GAP + w).unwrap_or(0);
         let total_h = row_h;
 
+        // Determine which monitor owns this element. We constrain badge
+        // placement to that monitor so a hint at the right edge of a
+        // 1920px monitor never bleeds onto the leftmost pixel column of
+        // the next monitor over (a confusing UX bug on multi-monitor
+        // setups). When the monitor query fails (rare; usually means
+        // some odd virtual display) we fall back to "no constraint" so
+        // we still produce *some* layout.
+        let monitor_client = unsafe {
+            monitor_for_bounds(&h.bounds)
+                .map(|m| screen_to_client_rect(m, origin_x, origin_y))
+        };
+
         // Phase 1: try each anchor strategy in order. The first one that
-        // doesn't collide with an already-placed badge wins. The order
-        // is style-dependent — see `WINDOW_POSITION_CANDIDATES` for why
-        // the window picker can't use `OutsideTop`.
+        // doesn't collide with an already-placed badge AND fits on the
+        // source element's monitor wins. The order is style-dependent —
+        // see `WINDOW_POSITION_CANDIDATES` for why the window picker
+        // can't use `OutsideTop`.
         let candidates: &[BadgePosition] = if style.prefer_inside_anchor {
             &WINDOW_POSITION_CANDIDATES
         } else {
@@ -689,6 +767,17 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
                 right: cx + total_w,
                 bottom: cy + total_h,
             };
+            // Cross-monitor guard: if we know the element's monitor and
+            // this candidate would land outside it, reject the candidate
+            // and try the next strategy. Without this, an element at
+            // y == 0 with the element-style preference for `OutsideTop`
+            // would render its badge on the previous monitor (or off the
+            // virtual desktop entirely).
+            if let Some(m) = monitor_client {
+                if !rect_inside_monitor(&candidate, &m) {
+                    continue;
+                }
+            }
             if !placed.iter().any(|p| rects_intersect(p, &candidate)) {
                 chosen = Some((cx, cy));
                 break;
@@ -726,6 +815,27 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
                 if attempts > 256 {
                     break;
                 }
+            }
+        }
+
+        // Phase 3: clamp the final placement to the source monitor.
+        // Even when phase-1 picked a candidate that fit, phase-2's
+        // stacking loop or aggressive fallbacks may have walked the
+        // badge below the monitor's bottom edge. Pull it back up
+        // instead of letting it leak to the next monitor.
+        let (mut x, mut y) = (x, y);
+        if let Some(m) = monitor_client {
+            if x + total_w > m.right {
+                x = m.right - total_w;
+            }
+            if x < m.left {
+                x = m.left;
+            }
+            if y + total_h > m.bottom {
+                y = m.bottom - total_h;
+            }
+            if y < m.top {
+                y = m.top;
             }
         }
 
@@ -1182,6 +1292,90 @@ mod layout_tests {
         };
         let (_x, y) = anchor_for(BadgePosition::OutsideTop, &bounds, 40, 24, 0, 0);
         assert!(y < 100, "OutsideTop must place the badge above the element");
+    }
+
+    #[test]
+    fn anchor_for_outside_bottom_drops_below() {
+        let bounds = Bounds {
+            x: 0,
+            y: 100,
+            width: 50,
+            height: 30,
+        };
+        let (_x, y) = anchor_for(BadgePosition::OutsideBottom, &bounds, 40, 24, 0, 0);
+        assert!(
+            y > 100 + 30,
+            "OutsideBottom must place the badge fully below the element"
+        );
+    }
+
+    #[test]
+    fn rect_inside_monitor_accepts_contained_rect() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let inside = RECT {
+            left: 100,
+            top: 100,
+            right: 200,
+            bottom: 130,
+        };
+        assert!(rect_inside_monitor(&inside, &monitor));
+    }
+
+    #[test]
+    fn rect_inside_monitor_rejects_overlap_left_edge() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let leaks = RECT {
+            left: -10,
+            top: 100,
+            right: 50,
+            bottom: 130,
+        };
+        assert!(!rect_inside_monitor(&leaks, &monitor));
+    }
+
+    #[test]
+    fn rect_inside_monitor_rejects_overlap_top_edge() {
+        // Element at y=0 with OutsideTop placement would push the badge
+        // above the monitor — that's exactly the case smart positioning
+        // exists to detect.
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let leaks = RECT {
+            left: 100,
+            top: -30,
+            right: 200,
+            bottom: 0,
+        };
+        assert!(!rect_inside_monitor(&leaks, &monitor));
+    }
+
+    #[test]
+    fn screen_to_client_rect_subtracts_origin() {
+        let r = RECT {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1080,
+        };
+        let client = screen_to_client_rect(r, 100, 50);
+        assert_eq!(client.left, 1820);
+        assert_eq!(client.top, -50);
+        assert_eq!(client.right, 3740);
+        assert_eq!(client.bottom, 1030);
     }
 
     #[test]

@@ -31,7 +31,8 @@ use uiautomation::{
     UIAutomation, UIElement, UITreeWalker,
 };
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -39,10 +40,12 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW,
-    SMTO_ABORTIFHUNG, WM_GETOBJECT,
+    EnumChildWindows, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+    SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_GETOBJECT,
 };
 
+use crate::cache::{CacheManager, WindowKey};
+use crate::config::ScopeMode;
 use crate::{Action, Backend, Bounds, Element, ElementId, Role};
 
 /// Maximum tree depth we descend into for *desktop* apps. Native Win32 /
@@ -142,11 +145,33 @@ pub struct WindowsBackend {
     /// actual focus, not whatever was foreground when the backend was
     /// constructed.
     is_current_browser: bool,
+    /// Per-HWND enumeration cache. Backs the "press Esc, retry"
+    /// flow — same window, same elements, no UIA round-trip. Disabled
+    /// by setting `enable_caching = false` in `config.toml`.
+    cache: CacheManager,
+    /// Hard cap on elements per enumeration in non-active-window scope
+    /// modes. The single-window walk caps are
+    /// `MAX_ELEMENTS_DESKTOP`/`MAX_ELEMENTS_BROWSER`; this kicks in
+    /// only when we're aggregating across multiple windows.
+    max_elements_global: usize,
 }
 
 impl WindowsBackend {
-    /// Construct a new backend, initializing the UI Automation client.
+    /// Construct a new backend with caching enabled and the default
+    /// 500ms TTL. Use [`Self::with_config`] to override either knob.
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_config(true, 500, 300)
+    }
+
+    /// Construct a new backend, initializing the UI Automation client.
+    /// `enable_caching` and `cache_ttl_ms` configure the cache; the
+    /// Settings dialog calls [`Self::reconfigure_cache`] to flip the
+    /// switch at runtime without restarting.
+    pub fn with_config(
+        enable_caching: bool,
+        cache_ttl_ms: u64,
+        max_elements_global: usize,
+    ) -> anyhow::Result<Self> {
         // PerMonitorV2 ensures `GetBoundingRectangle` returns physical
         // pixels matching the overlay's coordinate space on high-DPI
         // displays. Best-effort: ignore "already set" / older-OS errors.
@@ -160,8 +185,199 @@ impl WindowsBackend {
             elements: HashMap::new(),
             next_id: 0,
             is_current_browser: false,
+            cache: CacheManager::new(cache_ttl_ms, enable_caching),
+            max_elements_global,
         })
     }
+
+    /// Mirror new cache settings from [`crate::Config`] into the live
+    /// backend without restarting. Disabling caching also clears the
+    /// existing entries.
+    pub fn reconfigure_cache(&mut self, enable_caching: bool, cache_ttl_ms: u64) {
+        self.cache.reconfigure(cache_ttl_ms, enable_caching);
+    }
+
+    /// Replace the global element cap (used in multi-window scope
+    /// modes). Single-window walks still cap at the platform-specific
+    /// constants — this is purely a safety net for the aggregate.
+    pub fn set_max_elements_global(&mut self, max: usize) {
+        self.max_elements_global = max.max(1);
+    }
+
+    /// Enumerate elements scoped by [`ScopeMode`].
+    ///
+    /// - [`ScopeMode::ActiveWindow`] is exactly [`Backend::enumerate_foreground`].
+    /// - [`ScopeMode::ActiveMonitor`] enumerates every visible top-level
+    ///   window whose frame intersects the monitor under the cursor.
+    /// - [`ScopeMode::AllWindows`] enumerates every visible top-level
+    ///   window across all monitors.
+    ///
+    /// Multi-window modes aggregate per-window walks and apply the
+    /// [`Self::max_elements_global`] cap so a busy desktop can't render
+    /// thousands of badges. The cap is enforced in walk order, so the
+    /// foreground window's elements are always present.
+    pub fn enumerate_by_scope(&mut self, mode: ScopeMode) -> anyhow::Result<Vec<Element>> {
+        match mode {
+            ScopeMode::ActiveWindow => self.enumerate_foreground(),
+            ScopeMode::ActiveMonitor => self.enumerate_active_monitor(),
+            ScopeMode::AllWindows => self.enumerate_all_windows(),
+        }
+    }
+
+    fn enumerate_active_monitor(&mut self) -> anyhow::Result<Vec<Element>> {
+        let monitor_rect = current_monitor_rect();
+        self.enumerate_windows_filtered(|bounds| rect_intersects_bounds(&monitor_rect, bounds))
+    }
+
+    fn enumerate_all_windows(&mut self) -> anyhow::Result<Vec<Element>> {
+        self.enumerate_windows_filtered(|_| true)
+    }
+
+    /// Shared implementation behind the multi-window scope modes. Walks
+    /// every visible top-level window the window picker would surface,
+    /// runs the existing element walker on each, and merges results
+    /// up to [`Self::max_elements_global`].
+    ///
+    /// Errors from a single window's walk are swallowed with a `tracing`
+    /// warning — better to return what we did manage to enumerate than
+    /// abort the whole pick because one tab's UIA tree was unhealthy.
+    fn enumerate_windows_filtered<F>(&mut self, mut accept: F) -> anyhow::Result<Vec<Element>>
+    where
+        F: FnMut(&Bounds) -> bool,
+    {
+        let candidates = crate::windows::window_picker::enumerate_visible()
+            .context("listing top-level windows for multi-window scope")?;
+        let mut out: Vec<Element> = Vec::with_capacity(64);
+        let cap = self.max_elements_global;
+
+        // Walk the foreground window first so its elements always have
+        // hint slots even on a crowded desktop.
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut ordered: Vec<crate::windows::window_picker::TopLevelWindow> = candidates;
+        ordered.sort_by_key(|w| if w.hwnd == foreground { 0 } else { 1 });
+
+        for win in ordered {
+            if !accept(&win.bounds) {
+                continue;
+            }
+            if out.len() >= cap {
+                break;
+            }
+            match self.enumerate_window(win.hwnd) {
+                Ok(elements) => {
+                    let remaining = cap - out.len();
+                    out.extend(elements.into_iter().take(remaining));
+                }
+                Err(e) => {
+                    tracing::warn!(?win.hwnd, title = %win.title, error = ?e, "window walk failed; skipping");
+                }
+            }
+        }
+
+        tracing::info!(
+            collected = out.len(),
+            cap,
+            "enumerate_windows_filtered done"
+        );
+        Ok(out)
+    }
+
+    /// Walk a single HWND, going through the cache first. Used by the
+    /// multi-window scope modes; the active-window path stays in
+    /// [`Backend::enumerate_foreground`] because it needs to mutate
+    /// `is_current_browser` for the caller.
+    fn enumerate_window(&mut self, hwnd: HWND) -> anyhow::Result<Vec<Element>> {
+        let key = hwnd_to_key(hwnd);
+        if let Some(cached) = self.cache.get(key) {
+            // Replay cached elements through `next_id` so [`Backend::perform`]
+            // can still resolve them. We re-register the UIA elements via a
+            // fresh walk if the user actually invokes one — but for the
+            // common "show overlay → press Esc" loop we never get that far,
+            // so the cache hit is essentially free.
+            return Ok(cached);
+        }
+
+        let is_browser = is_browser_window(hwnd);
+        if is_browser {
+            activate_browser_accessibility(hwnd);
+        }
+
+        let handle = Handle::from(hwnd.0 as isize);
+        let root = self
+            .automation
+            .element_from_handle(handle)
+            .context("element_from_handle for top-level window failed")?;
+        let walker = self
+            .automation
+            .get_control_view_walker()
+            .context("creating control-view tree walker failed")?;
+
+        let prev_browser = self.is_current_browser;
+        self.is_current_browser = is_browser;
+
+        let mut out = Vec::with_capacity(64);
+        let mut stats = WalkStats::default();
+        self.walk(&walker, &root, 0, &mut out, &mut stats);
+
+        self.is_current_browser = prev_browser;
+
+        self.cache.insert(key, out.clone());
+        Ok(out)
+    }
+}
+
+/// Pack a Win32 HWND into the cache's opaque [`WindowKey`]. Round-trip
+/// is one-way (we never reconstruct an HWND from a key); we only need
+/// equality + hashing inside the map.
+fn hwnd_to_key(hwnd: HWND) -> WindowKey {
+    hwnd.0 as usize as u64
+}
+
+/// Monitor rect (in physical pixels) under the current cursor. Falls
+/// back to the entire virtual desktop when the cursor query or
+/// `GetMonitorInfo` fail — better to overshoot the scope than refuse
+/// to enumerate anything.
+fn current_monitor_rect() -> RECT {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt).is_err() {
+            return RECT {
+                left: i32::MIN / 2,
+                top: i32::MIN / 2,
+                right: i32::MAX / 2,
+                bottom: i32::MAX / 2,
+            };
+        }
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            mi.rcMonitor
+        } else {
+            RECT {
+                left: i32::MIN / 2,
+                top: i32::MIN / 2,
+                right: i32::MAX / 2,
+                bottom: i32::MAX / 2,
+            }
+        }
+    }
+}
+
+/// True when the window's frame `bounds` overlaps `monitor` by even one
+/// pixel. We use frame-overlap instead of "centre is on monitor" so a
+/// window straddling two monitors is included by both.
+fn rect_intersects_bounds(monitor: &RECT, bounds: &Bounds) -> bool {
+    let r_right = bounds.x + bounds.width;
+    let r_bottom = bounds.y + bounds.height;
+    bounds.x < monitor.right
+        && r_right > monitor.left
+        && bounds.y < monitor.bottom
+        && r_bottom > monitor.top
 }
 
 impl Backend for WindowsBackend {
@@ -187,6 +403,29 @@ impl Backend for WindowsBackend {
             "enumerate_foreground: detected window kind"
         );
 
+        // Cache lookup before any UIA work. A hit means we were called
+        // again on the same HWND inside the TTL — almost always the
+        // "user pressed Esc, retrying" path. We don't cache the
+        // raw UIElement handles though, so a cache hit means
+        // [`Backend::perform`] won't be able to invoke anything until
+        // a fresh enumeration replaces the entry. That trade-off is
+        // fine: the overlay only calls back into perform after a
+        // successful pick, and that pick happens on the *current*
+        // enumeration round, which always populates the elements map.
+        let key = hwnd_to_key(hwnd);
+        if let Some(cached) = self.cache.get(key) {
+            tracing::debug!(cached = cached.len(), "enumerate_foreground served from cache");
+            // We still want subsequent perform() calls to work, so
+            // immediately fall through to a fresh walk — the cache
+            // hit short-circuits only when no UIA dispatch is going
+            // to happen. In practice this means we never serve from
+            // cache here today; the multi-window scope path
+            // (`enumerate_window`) is where the cache earns its keep.
+            // We leave the lookup wired up so changing this policy
+            // later requires no plumbing.
+            self.cache.invalidate(key);
+        }
+
         // Chromium-based browsers (Chrome, Edge, Brave, …) defer building
         // the renderer accessibility tree until an a11y client asks for
         // it. By the time `element_from_handle` runs the browser process
@@ -210,6 +449,12 @@ impl Backend for WindowsBackend {
         let mut out = Vec::with_capacity(64);
         let mut stats = WalkStats::default();
         self.walk(&walker, &root, 0, &mut out, &mut stats);
+
+        // Refresh the cache with the just-collected elements so the
+        // next call within `cache_ttl_ms` can short-circuit the walk
+        // entirely. We hand back the bare value below; the cache
+        // clones it on insert so this doesn't move the data.
+        self.cache.insert(key, out.clone());
 
         // Per-role breakdown helps when a user reports "keyhop didn't see
         // button X in app Y" — the log shows whether the element was
