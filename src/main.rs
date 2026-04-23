@@ -244,6 +244,7 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     println!("keyhop {} is running.", env!("CARGO_PKG_VERSION"));
     println!("  Pick element : {}", config.hotkeys.pick_element);
     println!("  Pick window  : {}", config.hotkeys.pick_window);
+    println!("  Open settings: {}", config.hotkeys.open_settings);
     println!("  Cancel       : Esc (inside overlay)");
     #[cfg(debug_assertions)]
     {
@@ -310,12 +311,33 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         }
 
         for action in hotkeys.poll_actions() {
-            if let Err(e) = dispatch_hotkey(action, &mut backend, &runtime) {
-                tracing::error!(?action, error = ?e, "hotkey handler failed");
-                notification::error(
-                    "keyhop: action failed",
-                    &format!("{action:?} failed:\n{e}\n\nSee log for details."),
-                );
+            match action {
+                HotkeyAction::OpenSettings => match settings_window::show(&config) {
+                    Ok(Some(new_config)) => {
+                        apply_config(
+                            &new_config,
+                            &mut config,
+                            &mut runtime,
+                            &mut backend,
+                            &mut hotkeys,
+                            /* announce = */ true,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = ?e, "settings window failed");
+                        notification::error("Couldn't open Settings", &format!("{e}"));
+                    }
+                },
+                _ => {
+                    if let Err(e) = dispatch_hotkey(action, &mut backend, &runtime) {
+                        tracing::error!(?action, error = ?e, "hotkey handler failed");
+                        notification::error(
+                            "keyhop: action failed",
+                            &format!("{action:?} failed:\n{e}\n\nSee log for details."),
+                        );
+                    }
+                }
             }
         }
 
@@ -513,6 +535,7 @@ fn dispatch_hotkey(
     match action {
         HotkeyAction::PickElement => handle_pick_element(backend, runtime),
         HotkeyAction::PickWindow => handle_pick_window(runtime),
+        HotkeyAction::OpenSettings => Ok(()), // Handled separately in main loop
     }
 }
 

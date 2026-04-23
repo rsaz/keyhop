@@ -5,6 +5,16 @@ All notable changes to `keyhop` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Open settings hotkey** — new global hotkey (`Ctrl+Shift+,` by default) to open the Settings dialog directly from anywhere. Previously, settings could only be opened from the tray menu.
+
+### Changed
+
+- **Settings window improvements** — the Settings dialog now opens centered on screen and always on top (topmost window). Multiple invocations (via hotkey, tray menu, or repeated clicks) now bring the existing window to the foreground instead of creating duplicate dialogs, preventing accidentally opening multiple settings windows. Press `Esc` to close the settings window (same as clicking Cancel).
+
 ## [0.4.0] - 2026-04-22
 
 UX & performance release. Closes

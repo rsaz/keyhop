@@ -32,6 +32,8 @@ pub enum HotkeyAction {
     /// Show the hint overlay for every visible top-level window across all
     /// monitors. Default: `Ctrl + Alt + Space`.
     PickWindow,
+    /// Open the settings dialog. Default: `Ctrl + Shift + ,`.
+    OpenSettings,
 }
 
 /// Registered hotkeys. Drop releases all OS registrations.
@@ -79,6 +81,7 @@ impl Hotkeys {
         for (action, raw) in [
             (HotkeyAction::PickElement, &bindings.pick_element),
             (HotkeyAction::PickWindow, &bindings.pick_window),
+            (HotkeyAction::OpenSettings, &bindings.open_settings),
         ] {
             match parse_hotkey(raw) {
                 Ok((mods, code)) => {
@@ -174,6 +177,7 @@ impl fmt::Display for HotkeyAction {
         match self {
             HotkeyAction::PickElement => write!(f, "Pick element"),
             HotkeyAction::PickWindow => write!(f, "Pick window"),
+            HotkeyAction::OpenSettings => write!(f, "Open settings"),
         }
     }
 }

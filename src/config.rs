@@ -42,6 +42,8 @@ pub struct HotkeyBindings {
     pub pick_element: String,
     /// Pick window across all monitors. Default: `Ctrl+Alt+Space`.
     pub pick_window: String,
+    /// Open settings dialog. Default: `Ctrl+Shift+,`.
+    pub open_settings: String,
 }
 
 impl Default for HotkeyBindings {
@@ -49,6 +51,7 @@ impl Default for HotkeyBindings {
         Self {
             pick_element: "Ctrl+Shift+Space".to_string(),
             pick_window: "Ctrl+Alt+Space".to_string(),
+            open_settings: "Ctrl+Shift+,".to_string(),
         }
     }
 }
