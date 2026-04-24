@@ -75,7 +75,10 @@ pub fn spawn(main_thread_id: u32) -> Result<Option<ConfigWatcher>> {
     let parent = match config_path.parent() {
         Some(p) => p.to_path_buf(),
         None => {
-            tracing::warn!(?config_path, "config path has no parent; hot-reload disabled");
+            tracing::warn!(
+                ?config_path,
+                "config path has no parent; hot-reload disabled"
+            );
             return Ok(None);
         }
     };
@@ -134,12 +137,8 @@ pub fn spawn(main_thread_id: u32) -> Result<Option<ConfigWatcher>> {
                 // needing an HWND; the main loop's GetMessageW
                 // dispatches it (msg.hwnd == NULL means "thread
                 // message" and skips DispatchMessage's window lookup).
-                let _ = PostThreadMessageW(
-                    main_thread_id,
-                    WM_USER_RELOAD_CONFIG,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ =
+                    PostThreadMessageW(main_thread_id, WM_USER_RELOAD_CONFIG, WPARAM(0), LPARAM(0));
             }
         });
     })

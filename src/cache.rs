@@ -131,7 +131,11 @@ impl<C: Clock> CacheManager<C> {
         let now = self.clock.now();
         match self.entries.get(&key) {
             Some(entry) if now.duration_since(entry.captured_at) <= self.ttl => {
-                tracing::debug!(key, age_ms = now.duration_since(entry.captured_at).as_millis() as u64, "cache hit");
+                tracing::debug!(
+                    key,
+                    age_ms = now.duration_since(entry.captured_at).as_millis() as u64,
+                    "cache hit"
+                );
                 Some(Arc::clone(&entry.elements))
             }
             Some(_) => {
@@ -339,8 +343,7 @@ mod tests {
 
     #[test]
     fn disabled_cache_misses_everything() {
-        let mut c: CacheManager<MockClock> =
-            CacheManager::with_clock(500, false, MockClock::new());
+        let mut c: CacheManager<MockClock> = CacheManager::with_clock(500, false, MockClock::new());
         c.insert(1, arc_of(vec![fake_element(1)]));
         assert!(c.get(1).is_none());
         assert_eq!(c.len(), 0, "insert should be a no-op when disabled");

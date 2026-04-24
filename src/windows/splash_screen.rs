@@ -179,10 +179,9 @@ unsafe extern "system" fn splash_wndproc(
         // suppresses the default white flash before WM_PAINT runs.
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
-            let data_ptr = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                hwnd,
-                GWLP_USERDATA,
-            ) as *const WindowData;
+            let data_ptr =
+                windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+                    as *const WindowData;
 
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -252,7 +251,9 @@ fn load_png(data: &[u8]) -> Result<Image> {
     let height = info.height;
 
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).context("PNG frame read failed")?;
+    let info = reader
+        .next_frame(&mut buf)
+        .context("PNG frame read failed")?;
 
     let rgba_data = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),

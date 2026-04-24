@@ -745,8 +745,7 @@ fn build_desktop_condition(
     let offscreen = prop(UIProperty::IsOffscreen, Variant::from(true))?;
     let on_screen = automation.create_not_condition(offscreen)?;
 
-    let with_control_element =
-        automation.create_and_condition(is_control_element, interactable)?;
+    let with_control_element = automation.create_and_condition(is_control_element, interactable)?;
     automation.create_and_condition(with_control_element, on_screen)
 }
 
@@ -1157,15 +1156,7 @@ pub(crate) fn walk_window(
         let walker = automation
             .get_control_view_walker()
             .context("creating control-view tree walker failed")?;
-        walk_recurse(
-            &walker,
-            cache_request,
-            &root,
-            0,
-            true,
-            &mut out,
-            &mut stats,
-        );
+        walk_recurse(&walker, cache_request, &root, 0, true, &mut out, &mut stats);
     } else {
         find_all_desktop(
             automation,
@@ -1323,10 +1314,7 @@ const MAX_HINT_PX: i32 = 1500;
 fn is_structural_clickable_type(ct: ControlType) -> bool {
     matches!(
         ct,
-        ControlType::ListItem
-            | ControlType::DataItem
-            | ControlType::TreeItem
-            | ControlType::Image
+        ControlType::ListItem | ControlType::DataItem | ControlType::TreeItem | ControlType::Image
     )
 }
 
@@ -1417,7 +1405,6 @@ fn dedup_nested_records(records: Vec<WalkRecord>) -> Vec<WalkRecord> {
         .collect()
 }
 
-
 /// Decide whether to record `el`, branching on browser vs desktop.
 fn try_record(el: &UIElement, is_browser: bool) -> Option<WalkRecord> {
     if cached_bool(el, UIProperty::IsOffscreen).unwrap_or(false) {
@@ -1455,75 +1442,75 @@ fn try_record_desktop_element(el: &UIElement, ct: ControlType) -> Option<WalkRec
     None
 }
 
-    /// Web-page / browser-content detection. Stricter than the desktop
-    /// path because the UIA tree mirrors the entire DOM and includes
-    /// piles of layout containers and decorative nodes.
-    ///
-    /// Detection cascade:
-    ///
-    /// 1. **High-confidence ControlTypes** (`Button`, `Hyperlink`,
-    ///    `Edit`, …) win immediately — these are unambiguous.
-    /// 2. **Structural types** (`Pane`, `Group`, `Image`, `Custom`,
-    ///    `Text`, `Document`) are only kept when they *also* expose an
-    ///    action pattern, an ARIA-mapped MSAA role, or
-    ///    `IsKeyboardFocusable=true`. This is the path that catches
-    ///    `<div role="button">`, `<a>` tags Chromium classifies as
-    ///    `Custom`, and click-handler-only divs that are still
-    ///    keyboard-tabbable (the modern accessibility floor).
-    /// 3. **Anything else** — last-chance ARIA / focus heuristic so
-    ///    the picker doesn't drop a target just because Chromium
-    ///    picked an exotic ControlType for it.
-    ///
-    /// Size filtering is split: known-interactive elements only need
-    /// to clear [`MIN_WEB_FOCUSABLE_SIZE`] (10px), so we still pick up
-    /// small icon buttons and chip "×" controls. Everything else has to
-    /// clear the stricter [`MIN_WEB_ELEMENT_SIZE`] (16px) — that's
-    /// where the spacer-element noise lives.
+/// Web-page / browser-content detection. Stricter than the desktop
+/// path because the UIA tree mirrors the entire DOM and includes
+/// piles of layout containers and decorative nodes.
+///
+/// Detection cascade:
+///
+/// 1. **High-confidence ControlTypes** (`Button`, `Hyperlink`,
+///    `Edit`, …) win immediately — these are unambiguous.
+/// 2. **Structural types** (`Pane`, `Group`, `Image`, `Custom`,
+///    `Text`, `Document`) are only kept when they *also* expose an
+///    action pattern, an ARIA-mapped MSAA role, or
+///    `IsKeyboardFocusable=true`. This is the path that catches
+///    `<div role="button">`, `<a>` tags Chromium classifies as
+///    `Custom`, and click-handler-only divs that are still
+///    keyboard-tabbable (the modern accessibility floor).
+/// 3. **Anything else** — last-chance ARIA / focus heuristic so
+///    the picker doesn't drop a target just because Chromium
+///    picked an exotic ControlType for it.
+///
+/// Size filtering is split: known-interactive elements only need
+/// to clear [`MIN_WEB_FOCUSABLE_SIZE`] (10px), so we still pick up
+/// small icon buttons and chip "×" controls. Everything else has to
+/// clear the stricter [`MIN_WEB_ELEMENT_SIZE`] (16px) — that's
+/// where the spacer-element noise lives.
 fn try_record_web_element(el: &UIElement, ct: ControlType) -> Option<WalkRecord> {
     use ControlType::*;
 
-        let bounds = el.get_cached_bounding_rectangle().ok()?;
-        let w = bounds.get_width();
-        let h = bounds.get_height();
-        // Hard floor: anything smaller than `MIN_WEB_FOCUSABLE_SIZE` is
-        // almost certainly noise even for "interactive" elements. This
-        // catches accessibility nodes Chromium materialises with a
-        // 1×1 / 4×4 hit-box for offscreen content.
-        if w < MIN_WEB_FOCUSABLE_SIZE || h < MIN_WEB_FOCUSABLE_SIZE {
-            return None;
-        }
-        let big_enough_for_anything = w >= MIN_WEB_ELEMENT_SIZE && h >= MIN_WEB_ELEMENT_SIZE;
+    let bounds = el.get_cached_bounding_rectangle().ok()?;
+    let w = bounds.get_width();
+    let h = bounds.get_height();
+    // Hard floor: anything smaller than `MIN_WEB_FOCUSABLE_SIZE` is
+    // almost certainly noise even for "interactive" elements. This
+    // catches accessibility nodes Chromium materialises with a
+    // 1×1 / 4×4 hit-box for offscreen content.
+    if w < MIN_WEB_FOCUSABLE_SIZE || h < MIN_WEB_FOCUSABLE_SIZE {
+        return None;
+    }
+    let big_enough_for_anything = w >= MIN_WEB_ELEMENT_SIZE && h >= MIN_WEB_ELEMENT_SIZE;
 
-        // Phase 1: high-confidence ControlTypes always win — even at
-        // the smaller 10px size, since something the browser explicitly
-        // labelled as e.g. a Button is clearly clickable.
-        let role = match ct {
-            Button | SplitButton => Some(Role::Button),
-            Hyperlink => Some(Role::Link),
-            Edit => Some(Role::TextInput),
-            CheckBox => Some(Role::Checkbox),
-            RadioButton => Some(Role::Radio),
-            ComboBox => Some(Role::ComboBox),
-            MenuItem => Some(Role::MenuItem),
-            TabItem => Some(Role::Tab),
-            ListItem | TreeItem | DataItem => Some(Role::ListItem),
+    // Phase 1: high-confidence ControlTypes always win — even at
+    // the smaller 10px size, since something the browser explicitly
+    // labelled as e.g. a Button is clearly clickable.
+    let role = match ct {
+        Button | SplitButton => Some(Role::Button),
+        Hyperlink => Some(Role::Link),
+        Edit => Some(Role::TextInput),
+        CheckBox => Some(Role::Checkbox),
+        RadioButton => Some(Role::Radio),
+        ComboBox => Some(Role::ComboBox),
+        MenuItem => Some(Role::MenuItem),
+        TabItem => Some(Role::Tab),
+        ListItem | TreeItem | DataItem => Some(Role::ListItem),
 
-            // Phase 2: ambiguous / structural types need *some* signal
-            // that they're interactive before we count them.
-            Image | Custom | Pane | Group | Text | Document => {
-                let interactive = has_any_action_pattern(el)
-                    || looks_clickable_web(el)
-                    || cached_bool(el, UIProperty::IsKeyboardFocusable).unwrap_or(false);
-                if !interactive {
-                    None
-                } else if matches!(ct, Image) {
-                    Some(Role::Button)
-                } else {
-                    Some(Role::Other)
-                }
+        // Phase 2: ambiguous / structural types need *some* signal
+        // that they're interactive before we count them.
+        Image | Custom | Pane | Group | Text | Document => {
+            let interactive = has_any_action_pattern(el)
+                || looks_clickable_web(el)
+                || cached_bool(el, UIProperty::IsKeyboardFocusable).unwrap_or(false);
+            if !interactive {
+                None
+            } else if matches!(ct, Image) {
+                Some(Role::Button)
+            } else {
+                Some(Role::Other)
             }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
 
     if let Some(role) = role {
         // Big_enough_for_anything is only enforced for Phase 2 noise:

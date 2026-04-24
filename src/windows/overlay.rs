@@ -393,7 +393,10 @@ impl OverlayState {
             SourceConstantAlpha: opacity,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        let size = windows::Win32::Foundation::SIZE { cx: width, cy: height };
+        let size = windows::Win32::Foundation::SIZE {
+            cx: width,
+            cy: height,
+        };
         let src_pt = POINT { x: 0, y: 0 };
         let _ = UpdateLayeredWindow(
             hwnd,
@@ -408,14 +411,7 @@ impl OverlayState {
         );
     }
 
-    unsafe fn draw_hint(
-        &self,
-        hdc: HDC,
-        bits: *mut u8,
-        dib_w: i32,
-        dib_h: i32,
-        laid: &LaidHint,
-    ) {
+    unsafe fn draw_hint(&self, hdc: HDC, bits: *mut u8, dib_w: i32, dib_h: i32, laid: &LaidHint) {
         // Hide hints whose label doesn't match the typed prefix.
         if !self.typed.is_empty() && !laid.label.starts_with(&self.typed) {
             return;
@@ -819,8 +815,7 @@ fn lay_out(hints: &[Hint], style: &HintStyle, origin_x: i32, origin_y: i32) -> V
         // some odd virtual display) we fall back to "no constraint" so
         // we still produce *some* layout.
         let monitor_client = unsafe {
-            monitor_for_bounds(&h.bounds)
-                .map(|m| screen_to_client_rect(m, origin_x, origin_y))
+            monitor_for_bounds(&h.bounds).map(|m| screen_to_client_rect(m, origin_x, origin_y))
         };
 
         // Phase 1: try each anchor strategy in order. The first one that
@@ -1284,8 +1279,8 @@ impl PersistentOverlay {
         )
         .context("CreateWindowExW failed")?;
 
-        let (mem_dc, dib, bits) = create_dib_surface(vw, vh)
-            .context("failed to allocate overlay DIB surface")?;
+        let (mem_dc, dib, bits) =
+            create_dib_surface(vw, vh).context("failed to allocate overlay DIB surface")?;
 
         let _ = hinstance;
         Ok(Self {
@@ -1307,14 +1302,22 @@ impl PersistentOverlay {
         if vx == self.origin_x && vy == self.origin_y && vw == self.width && vh == self.height {
             return Ok(());
         }
-        let _ = SetWindowPos(self.hwnd, None, vx, vy, vw, vh, SWP_NOZORDER | SWP_NOACTIVATE);
+        let _ = SetWindowPos(
+            self.hwnd,
+            None,
+            vx,
+            vy,
+            vw,
+            vh,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         if vw != self.width || vh != self.height {
             // Tear down the old DIB before allocating the new one so we
             // don't double the peak memory footprint on reconnects.
             let _ = DeleteDC(self.mem_dc);
             let _ = DeleteObject(HGDIOBJ(self.dib.0));
-            let (mem_dc, dib, bits) = create_dib_surface(vw, vh)
-                .context("failed to reallocate overlay DIB surface")?;
+            let (mem_dc, dib, bits) =
+                create_dib_surface(vw, vh).context("failed to reallocate overlay DIB surface")?;
             self.mem_dc = mem_dc;
             self.dib = dib;
             self.bits = bits;
@@ -1356,7 +1359,14 @@ impl PersistentOverlay {
         // the previously focused app visually unchanged underneath the
         // overlay; we still SetForegroundWindow + SetFocus so key
         // events route to us.
-        state.render_to_dib(self.hwnd, self.mem_dc, self.bits, self.width, self.height, opacity);
+        state.render_to_dib(
+            self.hwnd,
+            self.mem_dc,
+            self.bits,
+            self.width,
+            self.height,
+            opacity,
+        );
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetForegroundWindow(self.hwnd);
         let _ = SetFocus(self.hwnd);
@@ -1548,14 +1558,24 @@ unsafe fn frame_rect_argb(bits: *mut u8, dib_w: i32, dib_h: i32, rect: &RECT, co
     if rect.right <= rect.left || rect.bottom <= rect.top {
         return;
     }
-    let top = RECT { left: rect.left, top: rect.top, right: rect.right, bottom: rect.top + 1 };
+    let top = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.top + 1,
+    };
     let bottom = RECT {
         left: rect.left,
         top: rect.bottom - 1,
         right: rect.right,
         bottom: rect.bottom,
     };
-    let left = RECT { left: rect.left, top: rect.top, right: rect.left + 1, bottom: rect.bottom };
+    let left = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.left + 1,
+        bottom: rect.bottom,
+    };
     let right = RECT {
         left: rect.right - 1,
         top: rect.top,
@@ -1926,7 +1946,12 @@ mod spatial_grid_tests {
     use super::*;
 
     fn r(l: i32, t: i32, w: i32, h: i32) -> RECT {
-        RECT { left: l, top: t, right: l + w, bottom: t + h }
+        RECT {
+            left: l,
+            top: t,
+            right: l + w,
+            bottom: t + h,
+        }
     }
 
     #[test]

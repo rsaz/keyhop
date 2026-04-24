@@ -190,7 +190,9 @@ impl HintEngine {
         // but at least it never panics and never returns duplicates.
         if n == 1 {
             let ch = self.alphabet[0];
-            return (1..=count).map(|len| std::iter::repeat(ch).take(len).collect()).collect();
+            return (1..=count)
+                .map(|len| std::iter::repeat(ch).take(len).collect())
+                .collect();
         }
 
         // When count <= n, every label is length 1 regardless of
@@ -259,7 +261,11 @@ impl HintEngine {
         // unconstrained case.
         let min_len = if prefix_offset == 0 { 1 } else { 2 };
         let mut l = min_len;
-        let mut cap = if l == 1 { usable_prefixes } else { usable_prefixes * n };
+        let mut cap = if l == 1 {
+            usable_prefixes
+        } else {
+            usable_prefixes * n
+        };
         while cap < remaining {
             l += 1;
             cap = match cap.checked_mul(n) {
@@ -271,7 +277,11 @@ impl HintEngine {
         // Demote to length L-1 only if L-1 is still ≥ min_len — we must
         // not synthesize length-1 sub-shorts when the caller has
         // reserved that slot for forced singles.
-        let short_count = if l > min_len { (cap - remaining) / (n - 1) } else { 0 };
+        let short_count = if l > min_len {
+            (cap - remaining) / (n - 1)
+        } else {
+            0
+        };
         let long_count = remaining - short_count;
 
         let mut out: Vec<String> = Vec::with_capacity(remaining);
@@ -454,7 +464,11 @@ mod tests {
         let e = HintEngine::new(DEFAULT_ALPHABET);
         for count in [1, 5, 9, 10, 50, 81, 100, 200, 500] {
             let labels = e.generate(count);
-            assert_eq!(labels.len(), count, "count {count} produced wrong number of labels");
+            assert_eq!(
+                labels.len(),
+                count,
+                "count {count} produced wrong number of labels"
+            );
             let set: HashSet<_> = labels.iter().collect();
             assert_eq!(set.len(), labels.len(), "duplicate labels at count {count}");
             for (i, a) in labels.iter().enumerate() {
@@ -485,8 +499,7 @@ mod tests {
         // length-2 label, and the average length should be < 2.
         let e = HintEngine::new(DEFAULT_ALPHABET);
         let labels = e.generate(10);
-        let avg_len: f32 =
-            labels.iter().map(|l| l.len() as f32).sum::<f32>() / labels.len() as f32;
+        let avg_len: f32 = labels.iter().map(|l| l.len() as f32).sum::<f32>() / labels.len() as f32;
         assert!(
             avg_len < 2.0,
             "shortest_first should keep average length below 2 for count=10, got {avg_len}"
@@ -543,7 +556,10 @@ mod tests {
         assert_eq!(e.min_singles(), 0);
         let labels = e.generate(80);
         let singles = labels.iter().filter(|l| l.len() == 1).count();
-        assert_eq!(singles, 0, "optimal allocation should produce no singles at count=80");
+        assert_eq!(
+            singles, 0,
+            "optimal allocation should produce no singles at count=80"
+        );
     }
 
     #[test]

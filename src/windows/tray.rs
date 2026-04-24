@@ -180,7 +180,12 @@ fn build_icon() -> Result<Icon> {
     let big = target * SUPERSAMPLE;
 
     let buf_big = render_icon_high_res(big);
-    let buf_small = downsample(&buf_big, big as usize, target as usize, SUPERSAMPLE as usize);
+    let buf_small = downsample(
+        &buf_big,
+        big as usize,
+        target as usize,
+        SUPERSAMPLE as usize,
+    );
 
     Icon::from_rgba(buf_small, target, target).context("Icon::from_rgba")
 }

@@ -15,9 +15,9 @@
 
 use std::process::ExitCode;
 
-use keyhop::{Action, Backend, Config, Element, HintEngine};
 #[cfg(windows)]
 use keyhop::config::ScopeMode;
+use keyhop::{Action, Backend, Config, Element, HintEngine};
 
 #[cfg(windows)]
 use keyhop::windows::{
@@ -305,8 +305,8 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         let elapsed = splash_shown_at.elapsed().as_millis();
         if elapsed < MIN_SPLASH_MS {
             let remaining = MIN_SPLASH_MS - elapsed;
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(remaining as u64);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(remaining as u64);
             use ::windows::Win32::UI::WindowsAndMessaging::{
                 DispatchMessageW as DM, PeekMessageW as PM, TranslateMessage as TM, MSG as M,
                 PM_REMOVE as PMR,
@@ -442,10 +442,7 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
                         {
                             if let Err(e) = open_log_file() {
                                 tracing::error!(error = ?e, "failed to open log file");
-                                notification::error(
-                                    "keyhop: couldn't open log",
-                                    &format!("{e}"),
-                                );
+                                notification::error("keyhop: couldn't open log", &format!("{e}"));
                             }
                         }
                         #[cfg(debug_assertions)]
@@ -556,7 +553,9 @@ fn apply_config(
             tracing::error!(error = ?e, "re-registering hotkeys after reload failed");
             notification::error(
                 "keyhop: hotkey reload failed",
-                &format!("{e}\n\nThe previous chords are no longer active. Open Settings to retry."),
+                &format!(
+                    "{e}\n\nThe previous chords are no longer active. Open Settings to retry."
+                ),
             );
         }
     }

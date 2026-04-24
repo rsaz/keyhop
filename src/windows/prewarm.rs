@@ -32,9 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use parking_lot::Mutex;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Accessibility::{
-    SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK,
-};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
