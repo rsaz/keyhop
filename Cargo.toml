@@ -31,7 +31,7 @@ smallvec = "1.15.1"
 # without the `crate::windows` module), which keeps `cargo check` honest on
 # Linux/macOS even before native backends exist.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
