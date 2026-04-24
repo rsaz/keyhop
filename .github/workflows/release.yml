@@ -61,12 +61,24 @@ jobs:
           Write-Host "MSI: $($msi.FullName) ($([math]::Round($msi.Length/1MB,2)) MB)"
           Write-Host "EXE: $exe"
 
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.artifacts.outputs.exe }}"
+          $msi = "${{ steps.artifacts.outputs.msi }}"
+          (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower() + "  keyhop.exe"   | Out-File -Encoding ascii "target/release/keyhop.exe.sha256"
+          (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower() + "  $([System.IO.Path]::GetFileName($msi))" | Out-File -Encoding ascii "$msi.sha256"
+          Write-Host "keyhop.exe  : $((Get-FileHash $exe -Algorithm SHA256).Hash)"
+          Write-Host "$([System.IO.Path]::GetFileName($msi)): $((Get-FileHash $msi -Algorithm SHA256).Hash)"
+
       - name: Attach binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ steps.artifacts.outputs.exe }}
             ${{ steps.artifacts.outputs.msi }}
+            target/release/keyhop.exe.sha256
+            ${{ steps.artifacts.outputs.msi }}.sha256
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
