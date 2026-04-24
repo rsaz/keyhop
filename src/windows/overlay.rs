@@ -1156,9 +1156,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_KILLFOCUS => {
-            // Treat focus loss as cancel — no half-committed state.
-            state.selected = None;
-            state.done = true;
+            // Treat focus loss as cancel — but only when the pick is
+            // still active. The persistent-overlay teardown calls
+            // ShowWindow(SW_HIDE) on a window that still owns focus,
+            // and Windows synchronously dispatches WM_KILLFOCUS during
+            // that hide; without the `state.done` guard that path would
+            // clobber a just-set `selected` back to `None` and silently
+            // swallow the user's pick.
+            if !state.done {
+                state.selected = None;
+                state.done = true;
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -1384,14 +1392,22 @@ impl PersistentOverlay {
             }
         }
 
-        // Hide first, then unbind the state pointer — the order matters
+        // Snapshot the user's selection BEFORE any teardown. ShowWindow
+        // (SW_HIDE) on a focused window synchronously dispatches
+        // WM_KILLFOCUS through wnd_proc, and even with the `state.done`
+        // guard in the handler we don't want any future bookkeeping in
+        // there to risk overwriting `selected`. Read once, return that.
+        let result = state.selected;
+
+        // Hide first, then unbind the state pointer. The order matters
         // because ShowWindow can pump a few WM_KILLFOCUS / WM_NCACTIVATE
         // messages synchronously and we want them to find a still-valid
-        // state (or a null pointer that wnd_proc safely no-ops on).
+        // state (so the wnd_proc handler short-circuits on `state.done`)
+        // rather than a null pointer it then has to special-case.
         let _ = ShowWindow(self.hwnd, SW_HIDE);
         SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
 
-        Ok(state.selected)
+        Ok(result)
     }
 }
 
