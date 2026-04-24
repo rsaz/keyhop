@@ -286,7 +286,7 @@ unsafe fn create_bitmap_from_image(hdc: HDC, image: &Image) -> Result<HBITMAP> {
             biHeight: -(image.height as i32), // negative = top-down
             biPlanes: 1,
             biBitCount: 32,
-            biCompression: BI_RGB.0 as u32,
+            biCompression: BI_RGB.0,
             biSizeImage: 0,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,

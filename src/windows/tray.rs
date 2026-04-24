@@ -297,6 +297,7 @@ fn render_icon_high_res(size: u32) -> Vec<u8> {
 /// Box-filter downsample from `src_size`² to `dst_size`² (premultiplied
 /// average over `factor`² source pixels, in straight RGBA space). Cheap
 /// and gives respectable anti-aliasing for the icon rendering above.
+#[allow(clippy::manual_checked_ops)]
 fn downsample(src: &[u8], src_size: usize, dst_size: usize, factor: usize) -> Vec<u8> {
     let mut out = vec![0u8; dst_size * dst_size * 4];
     for dy in 0..dst_size {
@@ -358,6 +359,7 @@ fn fill_rect(buf: &mut [u8], stride: i32, x0: i32, y0: i32, x1: i32, y1: i32, rg
 /// Draw a thick line by stamping a square of side `thickness` at every
 /// pixel along the Bresenham path between the endpoints. Crude but
 /// produces clean diagonals at supersampled resolution.
+#[allow(clippy::too_many_arguments)]
 fn draw_thick_line(
     buf: &mut [u8],
     stride: i32,

@@ -1445,7 +1445,7 @@ unsafe fn create_dib_surface(width: i32, height: i32) -> Result<(HDC, HBITMAP, *
     // Negative biHeight = top-down, which lines up with our (x, y)
     // pixel-addressing convention so we don't have to flip rows when
     // patching alpha.
-    let mut bmi = BITMAPINFO {
+    let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width,
@@ -1458,7 +1458,7 @@ unsafe fn create_dib_surface(width: i32, height: i32) -> Result<(HDC, HBITMAP, *
         ..Default::default()
     };
     let mut bits: *mut c_void = std::ptr::null_mut();
-    let dib = CreateDIBSection(mem_dc, &mut bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+    let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
         .context("CreateDIBSection failed")?;
     if bits.is_null() {
         let _ = DeleteObject(HGDIOBJ(dib.0));
@@ -1592,6 +1592,7 @@ unsafe fn frame_rect_argb(bits: *mut u8, dib_w: i32, dib_h: i32, rect: &RECT, co
 /// it instead of `LineTo` because GDI line drawing leaves the alpha
 /// channel at 0 (so the line would be invisible after
 /// UpdateLayeredWindow even though the pixels were written).
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_line_argb(
     bits: *mut u8,
     dib_w: i32,
