@@ -4,7 +4,7 @@
 
 `keyhop` is a system-wide keyboard navigation layer that lets you control your whole computer without ever touching the mouse. Reaching for the mouse forces a constant context switch between thinking and pointing — your hands leave the home row, your eyes hunt for a cursor, and your flow breaks. `keyhop` keeps you on the keyboard so you stay fast, focused, and productive, using OS accessibility APIs (UI Automation on Windows) to target native UI elements semantically.
 
-**Status:** v0.3.0 — Windows backend with full webpage content detection (Chromium browsers), multi-monitor window picker, lifecycle controls (`keyhop --close`, `--clear-logs`, daily log rotation), visual Settings dialog, and a real **MSI installer** (no MSVC toolchain required to install). Linux backend planned.
+**Status:** v0.4.0 — UX & performance release on top of the v0.3.0 Windows backend. Adds variable-length hint labels (one keystroke for ≤9 targets), a Consolas overlay font, alphabet presets with ambiguous-character exclusion, multi-screen targeting modes (`active_window` / `active_monitor` / `all_windows`), monitor-aware badge positioning, and an in-process element-tree cache. Browser content detection (Chromium), multi-monitor window picker, lifecycle controls (`keyhop --close`, `--clear-logs`, daily log rotation), visual Settings dialog, and the MSI installer (no MSVC toolchain required to install) all carry over from v0.3.0. Linux backend planned.
 
 [![ci](https://github.com/rsaz/keyhop/actions/workflows/ci.yml/badge.svg)](https://github.com/rsaz/keyhop/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/keyhop.svg)](https://crates.io/crates/keyhop)
@@ -66,7 +66,7 @@ Grab `Keyhop-<version>-x86_64.msi` from the [latest GitHub Release](https://gith
 For unattended installs (CI, fleet rollout, MDM, Microsoft Store automated validation):
 
 ```powershell
-msiexec /i Keyhop-0.3.0-x86_64.msi /qn
+msiexec /i Keyhop-0.4.0-x86_64.msi /qn
 ```
 
 UAC will prompt once for admin rights (per-machine install).
@@ -141,7 +141,14 @@ Yellow badges = element picker (will *invoke* the control). Orange badges = wind
 `keyhop` is configured through a small visual dialog reachable from the tray icon (`Settings...`), so you never have to touch a config file unless you want to. The dialog lets you change:
 
 - **Hotkeys** — both leader chords. Type any combination of `Ctrl`, `Shift`, `Alt`, `Win`/`Super` modifiers plus a key (`A`-`Z`, `0`-`9`, `F1`-`F24`, `Space`, arrow keys, punctuation, etc.). Example: `Ctrl+Alt+K`.
-- **Hint alphabet** — the characters used to build hint labels. Default `asdfghjkl` (the home row).
+- **Hint alphabet** — the characters used to build hint labels. Default `asdfghjkl` (the home row). The Settings dialog now also exposes:
+  - a **preset** dropdown (`home_row`, `home_row_extended`, `lowercase_alpha`, `alphanumeric`, `numbers`, `custom`),
+  - **Include numbers** / **Include extended (`;` `'`)** toggles that append digits or the extended home-row keys,
+  - **Exclude ambiguous (O / 0)** to strip easy-to-confuse glyphs,
+  - and a **Custom additions** field for keyboard layouts that need extras beyond the preset.
+- **Hint strategy** — `Shortest first` (default) hands out single-character hints to the first `alphabet.len()` targets, then two-character hints, and so on (so up to 9 targets only need *one* keystroke). `Fixed length` reproduces the v0.3.0 behaviour where every label is the same length.
+- **Scope** — pick which surface the element picker walks: `Active window` (default, v0.3.0 behaviour), `Active monitor` (every visible top-level window on the monitor under your cursor), or `All windows` (every monitor; capped by `max_elements`, default 300, so a busy desktop can't render thousands of badges).
+- **Performance** — toggles the in-process element-tree cache (default on, 500 ms TTL). The cache memoises each window's UIA enumeration so the "press Esc, retry" flow is instant on a steady screen.
 - **Overlay colors** — element badge background and window badge background, as `#RRGGBB` hex.
 - **Overlay opacity** — per-badge-style translucency from `0` to `100` (where `0` means "use the preset default" and `100` means fully opaque). Lower values let the underlying UI bleed through so you can see what you're about to invoke; the defaults sit around 90% for the element picker and 94% for the window picker.
 - **Target indicator** — when enabled, every element badge paints a thin outline (in the badge's background color) around the actual click target so it's instantly clear which underlying control each card represents — yellow badge, yellow rectangle around the matching element. When smart positioning had to push the badge off the element to dodge a collision, a connector line ending in a small filled triangle is also drawn from the badge to the element. On by default for the element picker; off for the window picker (which already shows a title pill). Toggle per picker via `colors.element.show_leader` / `colors.window.show_leader` in `config.toml`, or via the "Draw arrow from each badge to its target element" checkbox in the Settings dialog.
@@ -161,7 +168,21 @@ pick_element = "Ctrl+Shift+Space"
 pick_window  = "Ctrl+Alt+Space"
 
 [hints]
-alphabet = "asdfghjkl"
+alphabet           = "asdfghjkl"
+strategy           = "shortest_first"   # shortest_first | fixed_length
+preset             = "home_row"          # home_row | home_row_extended | lowercase_alpha | alphanumeric | numbers | custom
+include_numbers    = false               # append 0-9
+include_extended   = false               # append ; '
+exclude_ambiguous  = true                # strip O / 0 from the resolved alphabet
+custom_additions   = ""                  # extra chars appended verbatim
+
+[scope]
+mode         = "active_window"           # active_window | active_monitor | all_windows
+max_elements = 300                       # hard cap for all_windows mode
+
+[performance]
+enable_caching = true                    # memoise UIA element trees per window
+cache_ttl_ms   = 500                     # how long a cached enumeration stays fresh
 
 [colors.element]
 badge_bg     = "#FFE500"  # leave empty to keep the default
@@ -246,7 +267,17 @@ fn enumerate() -> anyhow::Result<()> {
 - [x] CI: `release.yml` builds and attaches both `keyhop.exe` and the MSI; `actions/checkout` and `softprops/action-gh-release` bumped to Node.js 24 versions
 - [x] Dependabot configured (`cargo` + `github-actions`, weekly)
 
-### Next up (v0.4.0) — Linux backend + signing
+### Shipped (v0.4.0)
+
+- [x] **Variable-length hint labels** with shortest-first allocation — single-character hints for ≤ 9 targets, then two-character for the next tier, etc. Legacy fixed-length still available via `[hints] strategy = "fixed_length"`. ([#4](https://github.com/rsaz/keyhop/issues/4))
+- [x] **Alphabet presets** (`home_row`, `home_row_extended`, `lowercase_alpha`, `alphanumeric`, `numbers`, `custom`) plus three independent modifiers (`include_numbers`, `include_extended`, `exclude_ambiguous`) and a free-form `custom_additions` field. All exposed in the Settings dialog.
+- [x] **Consolas overlay font** (replaces Segoe UI) — monospace, ships with every Windows version, draws `I` / `l` / `1` distinctly so typed-the-wrong-letter mistakes drop sharply.
+- [x] **Multi-screen targeting modes**: `active_window` (default), `active_monitor` (everything on the cursor's monitor), `all_windows` (every visible top-level window across every monitor, capped by `max_elements`).
+- [x] **Smart multi-monitor badge positioning** — overlay layout now respects the source monitor's work-area, drops candidate placements that would clip across monitors, and clamps fallbacks back inside the source monitor. The element-style picker also gained an `OutsideBottom` candidate as the off-element fallback when `OutsideTop` would clip.
+- [x] **Element-tree caching** — pluggable `Clock`-driven `CacheManager` memoises each window's UIA enumeration for a tunable TTL (default 500 ms), so repeat presses on a steady screen are instant. Toggle via `[performance] enable_caching` / `cache_ttl_ms`.
+- [x] **Settings dialog gains six new controls** for hint strategy, alphabet preset + modifiers, custom additions, scope mode, max elements, caching enable, and cache TTL. Window grew to 980×560 px.
+
+### Next up (v0.5.0) — Linux backend + signing
 
 - [ ] Linux backend via AT-SPI (X11 first, then Wayland)
 - [ ] Linux global hotkey integration (X11 `XGrabKey` / Wayland portal)
@@ -256,7 +287,7 @@ fn enumerate() -> anyhow::Result<()> {
 - [ ] Microsoft Trusted Signing for the MSI + EXE (kills the SmartScreen "unknown publisher" warning; see [`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md))
 - [ ] Firefox accessibility-tree activation (Gecko uses a different IPC dance than Chromium's `WM_GETOBJECT`)
 
-### v0.5.0 — macOS backend
+### v0.6.0 — macOS backend
 
 - [ ] macOS backend via the Accessibility API (`AXUIElement`)
 - [ ] macOS global hotkeys via `RegisterEventHotKey` / `MASShortcut`-style API
@@ -264,7 +295,7 @@ fn enumerate() -> anyhow::Result<()> {
 - [ ] macOS menu bar item with the same Settings / Pick / Quit affordances as the Windows tray
 - [ ] Notarized `.app` bundle build pipeline
 
-### v0.6.0 — Polish + cross-distro install
+### v0.7.0 — Polish + cross-distro install
 
 - [ ] Polished tray icon (multi-resolution `.ico` instead of the procedural badge)
 - [ ] Hot-reload config without restarting (re-register hotkeys at runtime)

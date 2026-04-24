@@ -1,104 +1,235 @@
 //! Visual Settings dialog.
 //!
-//! Hand-rolled Win32 window built directly on `windows-rs` so we don't add
-//! a heavyweight GUI framework just for one screen. The window is modal
-//! relative to the tray (the message loop blocks in [`show`] until the
-//! user closes it) and laid out manually in pixel coordinates.
-//!
-//! Layout (top-to-bottom):
+//! Hand-rolled Win32 dialog (no external GUI crate). Two-column layout
+//! grouped by section, with hover tooltips, a value-bound trackbar for
+//! every percentage knob, an UpDown spinner for every bounded integer,
+//! and a `ChooseColorW` swatch button for every color field. Saving
+//! returns the resulting [`Config`] so the caller in `main.rs` can
+//! hot-reload every subsystem without restarting the process.
 //!
 //! ```text
-//! ┌──────────────────────────────────────────────┐
-//! │ Hotkeys                                      │
-//! │   Pick element: [Ctrl+Shift+Space         ] │
-//! │   Pick window:  [Ctrl+Alt+Space           ] │
-//! │                                              │
-//! │ Hints                                        │
-//! │   Alphabet:     [asdfghjkl                ] │
-//! │                                              │
-//! │ Colors (#RRGGBB)                             │
-//! │   Element bg:   [#FFE500                  ] │
-//! │   Window bg:    [#33AAFF                  ] │
-//! │                                              │
-//! │ [x] Launch keyhop at Windows startup         │
-//! │                                              │
-//! │     [Save]   [Cancel]   [Reset to Defaults] │
-//! └──────────────────────────────────────────────┘
+//! ┌──────────────────────────────────┬──────────────────────────────────┐
+//! │ Hotkeys                          │ Colors (#RRGGBB)                 │
+//! │   Pick element [Ctrl+Shift+Space]│   Element bg [#FFE500] [▣]       │
+//! │   Pick window  [Ctrl+Alt+Space  ]│   Window  bg [#33AAFF] [▣]       │
+//! │                                  │                                  │
+//! │ Hints                            │ Opacity                          │
+//! │   Strategy ▼                     │   Element ━━●━━━━ 60             │
+//! │   Preset ▼                       │   Window  ━━━━━━━ 0              │
+//! │   Custom alphabet [_____]        │   [x] Draw arrow leader          │
+//! │   Custom additions [_____]       │                                  │
+//! │   [ ] Include numbers (0-9)      │ Scope                            │
+//! │   [ ] Include extended (; ')     │   Target windows ▼               │
+//! │   [x] Exclude ambiguous (O 0)    │   Max elements   [▲ 300 ▼]       │
+//! │   Min single-key  [▲ 8 ▼]        │                                  │
+//! │                                  │ Performance                      │
+//! │                                  │   [x] Cache enumeration          │
+//! │                                  │   Cache TTL ms   [▲ 500 ▼]       │
+//! │                                  │                                  │
+//! │                                  │ [x] Launch keyhop at startup     │
+//! ├──────────────────────────────────┴──────────────────────────────────┤
+//! │              [Save]   [Cancel]   [Reset to Defaults]                │
+//! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! On Save the window:
-//!   1. Reads each control's text via `WM_GETTEXT`.
-//!   2. Validates hotkeys + colors via the existing parsers (so what the
-//!      user can type is exactly what `config.toml` accepts).
-//!   3. Writes `config.toml`.
-//!   4. Mirrors the startup checkbox to the Run registry key.
-//!   5. Closes the window — the caller surfaces a "restart to apply"
-//!      hint since hot-reloading hotkeys mid-loop is out of scope for v0.2.0.
+//! Save / Reset flow:
+//!   1. Collect every field, validate (hotkey parsers, color hex, ranges).
+//!   2. Write `config.toml`, mirror Launch-at-Startup to the registry.
+//!   3. Stash the [`Config`] in [`State::saved_config`].
+//!   4. [`show`] returns it so `main` can hot-apply (see
+//!      `main::apply_config`).
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use anyhow::Result;
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, WHITE_BRUSH};
+use windows::core::{w, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateSolidBrush, DeleteObject, FillRect, FrameRect, GetStockObject, InvalidateRect, HBRUSH,
+    WHITE_BRUSH,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::BST_CHECKED;
+use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
+
+/// `SS_LEFT = 0`: left-aligned static text. Not in our enabled
+/// `windows-rs` feature set (it lives under `Win32_System_SystemServices`
+/// alongside dozens of unrelated constants we don't want to pull in)
+/// so we name it inline.
+const SS_LEFT_STYLE: u32 = 0x0000_0000;
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, BST_CHECKED, DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
+    ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGE,
+    TBM_SETTICFREQ, TBS_AUTOTICKS, TBS_HORZ, TOOLTIP_FLAGS, TTF_IDISHWND, TTF_SUBCLASS,
+    TTM_ADDTOOLW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, UDM_GETPOS32, UDM_SETPOS32,
+    UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_SETBUDDYINT,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowTextLengthW, GetWindowTextW, LoadCursorW, PostQuitMessage, RegisterClassExW,
-    SendMessageW, ShowWindow, TranslateMessage, UnregisterClassW, BM_GETCHECK, BM_SETCHECK,
-    BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL,
-    ES_LEFT, HMENU, IDC_ARROW, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_OVERLAPPED,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgItem, GetMessageW,
+    GetParent, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, IsWindow, LoadCursorW,
+    PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowTextW,
+    ShowWindow, TranslateMessage, UnregisterClassW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_OWNERDRAW, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
+    CBS_HASSTRINGS, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT, ES_AUTOHSCROLL,
+    ES_LEFT, ES_NUMBER, HMENU, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DRAWITEM, WM_HSCROLL, WM_KEYDOWN,
+    WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_TOPMOST,
+    WS_OVERLAPPED, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
-use crate::config::{BadgeColors, Config, HintConfig, HotkeyBindings, StartupConfig};
-use crate::hint::DEFAULT_ALPHABET;
+/// `TBM_GETPOS = WM_USER + 0`. Not generated by `windows-rs` 0.58's
+/// metadata (the rest of the TBM_* family lives there) so we name it
+/// inline to keep the trackbar code self-contained.
+const TBM_GETPOS: u32 = 0x0400; // WM_USER + 0
+/// Common-control class names. `WC_TRACKBARW` / `WC_UPDOWNW` aren't
+/// re-exported in 0.58 either; the literal Unicode strings are stable
+/// since IE3 / Windows 95 OSR2.
+const TRACKBAR_CLASS: PCWSTR = w!("msctls_trackbar32");
+const UPDOWN_CLASS: PCWSTR = w!("msctls_updown32");
+
+use crate::alphabet_presets::{self, ALL_PRESETS};
+use crate::config::{
+    AlphabetPreset, BadgeColors, ColorConfig, Config, HintConfig, HotkeyBindings,
+    PerformanceConfig, ScopeConfig, ScopeMode, StartupConfig,
+};
+use crate::hint::{HintStrategy, DEFAULT_ALPHABET};
 use crate::windows::{hotkey, notification, overlay, startup};
 
-const WINDOW_W: i32 = 520;
+// ──────────────────── Layout constants ────────────────────
+
+const WINDOW_W: i32 = 860;
 const WINDOW_H: i32 = 640;
-const LABEL_W: i32 = 140;
-const FIELD_X: i32 = 170;
-const FIELD_W: i32 = 320;
-const ROW_H: i32 = 30;
 const PADDING: i32 = 14;
+
+/// Standard row height (control + 4px gap). Trackbars and color
+/// swatches use the same height for vertical rhythm.
+const ROW_H: i32 = 32;
+/// Section header takes a slightly taller line so the 11pt bold
+/// header doesn't clip its descenders against the next row.
+const SECTION_H: i32 = 26;
+/// Vertical breathing room between sibling sections.
+const SECTION_GAP: i32 = 12;
+
+const LABEL_W: i32 = 140;
+
+// Left column: x range 14..400.
+const LEFT_LABEL_X: i32 = PADDING;
+const LEFT_FIELD_X: i32 = LEFT_LABEL_X + LABEL_W + 4;
+const LEFT_FIELD_W: i32 = 240;
+
+// Right column: x range 440..824.
+const RIGHT_LABEL_X: i32 = 440;
+const RIGHT_FIELD_X: i32 = RIGHT_LABEL_X + LABEL_W + 4;
+const RIGHT_FIELD_W: i32 = 240;
+
+/// Width of the colored swatch button next to a hex color edit.
+const SWATCH_W: i32 = 28;
+
+// ──────────────────── Control IDs ────────────────────
+//
+// IDs grouped by purpose. The ranges (1001+, 1100+, 1200+, 1300+) are
+// stable so window_proc can dispatch on `id` without consulting the
+// State. Swatch buttons live in 1200+ so [`is_swatch_id`] is a simple
+// range check.
 
 const ID_PICK_ELEMENT: usize = 1001;
 const ID_PICK_WINDOW: usize = 1002;
-const ID_ALPHABET: usize = 1003;
-const ID_ELEMENT_BG: usize = 1004;
-const ID_WINDOW_BG: usize = 1005;
-const ID_LAUNCH_STARTUP: usize = 1006;
-const ID_ELEMENT_OPACITY: usize = 1007;
-const ID_WINDOW_OPACITY: usize = 1008;
-const ID_SHOW_LEADER: usize = 1009;
-const ID_SAVE: usize = 1100;
-const ID_CANCEL: usize = 1101;
-const ID_RESET: usize = 1102;
+const ID_OPEN_SETTINGS: usize = 1003;
+const ID_ALPHABET: usize = 1004;
+const ID_ELEMENT_BG: usize = 1005;
+const ID_WINDOW_BG: usize = 1006;
+const ID_LAUNCH_STARTUP: usize = 1007;
+const ID_ELEMENT_OPACITY: usize = 1008;
+const ID_WINDOW_OPACITY: usize = 1009;
+const ID_SHOW_LEADER: usize = 1010;
+const ID_HINT_STRATEGY: usize = 1011;
+const ID_ALPHABET_PRESET: usize = 1012;
+const ID_INCLUDE_NUMBERS: usize = 1013;
+const ID_INCLUDE_EXTENDED: usize = 1014;
+const ID_EXCLUDE_AMBIGUOUS: usize = 1015;
+const ID_CUSTOM_ADDITIONS: usize = 1016;
+const ID_SCOPE_MODE: usize = 1017;
+const ID_MAX_ELEMENTS: usize = 1018;
+const ID_ENABLE_CACHING: usize = 1019;
+const ID_CACHE_TTL_MS: usize = 1020;
+const ID_MIN_SINGLES: usize = 1021;
+
+// Numeric labels mirroring trackbar / spinner positions live in
+// the 1100+ range so we can update them on slider drag without an
+// extra State lookup.
+const ID_ELEMENT_OPACITY_LABEL: usize = 1100;
+const ID_WINDOW_OPACITY_LABEL: usize = 1101;
+
+// UpDown spinner buddies sit above their target edit in the 1150+
+// range. We don't read these directly — UDM_GETPOS32 reads through
+// the buddy.
+const ID_MIN_SINGLES_UD: usize = 1150;
+const ID_MAX_ELEMENTS_UD: usize = 1151;
+const ID_CACHE_TTL_UD: usize = 1152;
+
+// Color-picker swatch buttons. Range 1200..1209 reserved so
+// [`is_swatch_id`] stays a cheap range comparison and adding more
+// colors later doesn't require touching dispatch.
+const ID_ELEMENT_BG_SWATCH: usize = 1200;
+const ID_WINDOW_BG_SWATCH: usize = 1201;
+
+const ID_SAVE: usize = 1300;
+const ID_CANCEL: usize = 1301;
+const ID_RESET: usize = 1302;
+
+#[inline]
+fn is_swatch_id(id: usize) -> bool {
+    (1200..1210).contains(&id)
+}
+
+/// Hint-strategy dropdown entries, stable index → enum mapping.
+const STRATEGY_OPTIONS: &[(HintStrategy, &str)] = &[
+    (HintStrategy::ShortestFirst, "Shortest first (recommended)"),
+    (HintStrategy::FixedLength, "Fixed length"),
+];
+
+/// Scope-mode dropdown entries, stable index → enum mapping.
+const SCOPE_OPTIONS: &[(ScopeMode, &str)] = &[
+    (ScopeMode::ActiveWindow, "Active window only"),
+    (ScopeMode::ActiveMonitor, "All windows on active monitor"),
+    (ScopeMode::AllWindows, "All visible windows (every monitor)"),
+];
 
 /// Per-window state stashed in a thread_local. Holds child HWNDs we need
 /// to query on Save and the most recent button outcome.
 struct State {
     pick_element: HWND,
     pick_window: HWND,
+    open_settings: HWND,
     alphabet: HWND,
+    hint_strategy: HWND,
+    alphabet_preset: HWND,
+    include_numbers: HWND,
+    include_extended: HWND,
+    exclude_ambiguous: HWND,
+    custom_additions: HWND,
+    min_singles: HWND,
     element_bg: HWND,
     window_bg: HWND,
     element_opacity: HWND,
     window_opacity: HWND,
     show_leader: HWND,
+    scope_mode: HWND,
+    max_elements: HWND,
+    enable_caching: HWND,
+    cache_ttl_ms: HWND,
     launch_startup: HWND,
     /// Snapshot of the leader-line preference at dialog open. Used to
     /// decide whether to write `show_leader = Some(...)` or leave it as
     /// `None` (preset default) — we only persist an explicit override
     /// when the user actually toggled the checkbox.
     initial_show_leader: Option<bool>,
-    /// Set by the Save handler so [`show`] can return whether the config
-    /// was actually written (vs. user cancelled).
-    saved: bool,
+    /// `Some(_)` once the user clicks Save (or Reset to Defaults) and
+    /// the resulting [`Config`] has been written to disk. Surfaced to
+    /// [`show`] so the caller can hot-apply without re-reading the file.
+    saved_config: Option<Config>,
 }
 
 thread_local! {
@@ -108,11 +239,55 @@ thread_local! {
     static STATE: RefCell<Option<Box<State>>> = const { RefCell::new(None) };
 }
 
+/// Global tracking of the settings window HWND. Used to prevent multiple
+/// instances and to bring the existing window to foreground when the user
+/// tries to open settings again.
+static SETTINGS_WINDOW: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Open the modal Settings window. Blocks until the user closes it.
-/// Returns `Ok(true)` if the user clicked Save (config persisted),
-/// `Ok(false)` if they cancelled or closed the window.
-pub fn show(initial: &Config) -> Result<bool> {
+/// Returns `Ok(Some(cfg))` when the user clicked **Save** or
+/// **Reset to Defaults** (the resulting config has already been
+/// written to disk and is returned so the caller can hot-apply it
+/// without re-reading the file). Returns `Ok(None)` when the user
+/// cancelled or closed the window.
+/// Open the modal Settings window. Blocks until the user closes it.
+/// Returns `Ok(Some(cfg))` when the user clicked **Save** or
+/// **Reset to Defaults** (the resulting config has already been
+/// written to disk and is returned so the caller can hot-apply it
+/// without another I/O round-trip). Returns `Ok(None)` when the user
+/// cancelled.
+///
+/// If a settings window is already open, brings it to the foreground
+/// and returns `Ok(None)` immediately without blocking.
+pub fn show(initial: &Config) -> Result<Option<Config>> {
     unsafe {
+        // Check if settings window is already open
+        let existing_hwnd = SETTINGS_WINDOW.load(Ordering::Acquire);
+        if !existing_hwnd.is_null() {
+            let hwnd = HWND(existing_hwnd);
+            // Verify the window is still valid
+            if IsWindow(hwnd).as_bool() {
+                // Bring existing window to front
+                let _ = SetForegroundWindow(hwnd);
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                return Ok(None);
+            } else {
+                // Window was closed but not cleared, reset the tracking
+                SETTINGS_WINDOW.store(std::ptr::null_mut(), Ordering::Release);
+            }
+        }
+
+        // Pull in trackbar (TBM_*), updown (UDM_*), and tooltip
+        // (TTM_*) classes from comctl32. Without this, the
+        // CreateWindowExW call for `msctls_trackbar32` etc. returns
+        // ERROR_CANNOT_FIND_WND_CLASS. Best-effort: a `false` return
+        // means we'll fall back to plain edits, not a crash.
+        let icc = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_UPDOWN_CLASS,
+        };
+        let _ = InitCommonControlsEx(&icc);
+
         let hinstance = HINSTANCE(GetModuleHandleW(None)?.0);
         let class_name = w!("KeyhopSettingsWindow");
 
@@ -127,13 +302,19 @@ pub fn show(initial: &Config) -> Result<bool> {
         };
         let _ = RegisterClassExW(&wc);
 
+        // Calculate screen center position
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+        let x = (screen_w - WINDOW_W) / 2;
+        let y = (screen_h - WINDOW_H) / 2;
+
         let hwnd = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             class_name,
             w!("keyhop Settings"),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            x,
+            y,
             WINDOW_W,
             WINDOW_H,
             None,
@@ -142,8 +323,12 @@ pub fn show(initial: &Config) -> Result<bool> {
             None,
         )?;
 
+        // Track this window globally
+        SETTINGS_WINDOW.store(hwnd.0, Ordering::Release);
+
         build_controls(hwnd, hinstance, initial);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
 
         // Modal message pump: only this window's messages drive the loop,
         // so the caller's main message loop is paused for the dialog's
@@ -158,114 +343,453 @@ pub fn show(initial: &Config) -> Result<bool> {
             DispatchMessageW(&msg);
         }
 
-        let saved = STATE.with(|s| s.borrow().as_ref().map(|st| st.saved).unwrap_or(false));
-        STATE.with(|s| {
-            s.borrow_mut().take();
-        });
+        // Clear the global tracking when window closes
+        SETTINGS_WINDOW.store(std::ptr::null_mut(), Ordering::Release);
+
+        let saved_config = STATE.with(|s| s.borrow_mut().take().and_then(|st| st.saved_config));
         let _ = UnregisterClassW(class_name, hinstance);
 
-        Ok(saved)
+        Ok(saved_config)
     }
 }
 
+/// Tooltip text bundle. Pulled out of [`build_controls`] so the
+/// strings stay readable instead of disappearing inside long
+/// CreateWindow calls. Each entry is what the user sees when they
+/// hover the matching control for ~500 ms.
+mod tips {
+    pub const PICK_ELEMENT: &str = "Global hotkey to show interactive-element hints in the focused window.\n\nFormat: Ctrl+Shift+Space, Alt+K, F12, Ctrl+/.\nModifiers: Ctrl, Shift, Alt, Win.";
+    pub const PICK_WINDOW: &str =
+        "Global hotkey to switch between top-level windows.\n\nSame chord syntax as Pick element.";
+    pub const OPEN_SETTINGS: &str =
+        "Global hotkey to open this settings window.\n\nSame chord syntax as Pick element.";
+    pub const STRATEGY: &str = "How hint labels are allocated.\n\n• Shortest first — minimizes average keystrokes (Vimium-style).\n• Fixed length — every label has the same length; predictable but longer.";
+    pub const PRESET: &str = "Built-in alphabet preset.\n\n• Home row (asdfghjkl) — the default; minimal hand travel.\n• Home row + extended — adds ; ' for 11 keys.\n• Alphanumeric — letters + digits, 36 keys.\n• Letters only — full A-Z.\n• Custom — uses the Custom alphabet field below verbatim.";
+    pub const ALPHABET: &str = "Resolved hint alphabet (rebuilt automatically from the preset and modifier flags).\n\nEdit directly only when 'Custom' preset is selected — otherwise Save will overwrite this with the preset's value.";
+    pub const CUSTOM_ADDITIONS: &str = "Extra characters appended to the preset alphabet.\n\nUseful for non-ANSI keyboards or keys you have a habit of hitting (€, ç, ï…). Combined with the preset before ambiguous-character stripping.";
+    pub const INCLUDE_NUMBERS: &str =
+        "Append 0-9 to the alphabet. Increases capacity from 9 keys to 19 on the home-row preset.";
+    pub const INCLUDE_EXTENDED: &str = "Append ; and ' (right-hand pinky stretch) to the alphabet. Two extra single-key hints with no extra hand travel.";
+    pub const EXCLUDE_AMBIGUOUS: &str = "Strip O and 0 from the final alphabet so they can't be misread on a busy overlay. The Consolas overlay font already differentiates I, l, 1.";
+    pub const MIN_SINGLES: &str = "Guarantees at least this many one-keystroke hints, even on busy scenes where math-optimal allocation would skip them.\n\nDefault 8 = 'use every home-row letter as a single before doubling up'. Capped at (alphabet length − 1) at runtime so multi-char hints still have a prefix slot.";
+    pub const ELEMENT_BG: &str = "Background color of element badges. Format: #RRGGBB.\n\nClick the swatch to pick visually.";
+    pub const WINDOW_BG: &str = "Background color of window-picker badges. Format: #RRGGBB.\n\nClick the swatch to pick visually.";
+    pub const ELEMENT_OPACITY: &str =
+        "Element badge transparency.\n\n0 = use the preset default (90%).\n100 = fully opaque.";
+    pub const WINDOW_OPACITY: &str =
+        "Window badge transparency.\n\n0 = use the preset default (90%).\n100 = fully opaque.";
+    pub const SHOW_LEADER: &str = "Draw a thin colored arrow from each badge to its target element. Useful when badges are stacked or far from their target.";
+    pub const SCOPE: &str = "Which set of windows the element picker enumerates.\n\n• Active window only — fastest; legacy behaviour.\n• Active monitor — every visible window on the cursor's monitor.\n• All visible windows — every monitor; broadest reach, slowest.";
+    pub const MAX_ELEMENTS: &str = "Hard cap on collected elements per pick (multi-window scopes only).\n\nLower = snappier overlay; higher = more reachable targets. Active-window mode uses platform-specific caps and ignores this.";
+    pub const ENABLE_CACHING: &str = "Memoize element trees per window so repeat picks (Esc, retry) skip the slow accessibility walk.\n\nDisable only when debugging stale-results bugs; the TTL already keeps drift bounded.";
+    pub const CACHE_TTL: &str = "How long an element tree stays cached, in milliseconds.\n\nLower = fresher results when UI changes between picks; higher = faster repeat picks. 500 ms is a good balance.";
+    pub const LAUNCH_STARTUP: &str = "Run keyhop automatically when you sign in to Windows. Implemented by writing to HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.";
+    pub const SAVE: &str = "Apply changes immediately and close. Hotkeys, alphabet, scope, colors, and cache are all hot-reloaded — no restart needed.";
+    pub const CANCEL: &str = "Close without saving. Any pending changes are discarded.";
+    pub const RESET: &str = "Restore factory defaults and apply immediately. Closes the dialog and overwrites your config.toml with the built-in defaults.";
+}
+
+/// Build the entire control tree for the dialog. Returns nothing —
+/// every field HWND is captured into [`STATE`] so the window proc and
+/// Save handler can read them later. Layout math lives in the
+/// constants at the top of the file; this function is purely "place
+/// row N of column X".
 unsafe fn build_controls(hwnd: HWND, hinstance: HINSTANCE, initial: &Config) {
+    // Tooltip control — one per dialog, shared across every tool.
+    // TTS_ALWAYSTIP shows the tip regardless of focus state, and
+    // TTS_NOPREFIX disables `&` becoming an underline-shortcut.
+    let tooltip = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("tooltips_class32"),
+        PCWSTR::null(),
+        WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        hwnd,
+        HMENU::default(),
+        hinstance,
+        None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()));
+
+    // ──────────────── LEFT COLUMN ────────────────
     let mut y = PADDING;
 
-    create_section_label(hwnd, hinstance, "Hotkeys", y);
-    y += 22;
+    create_section(
+        hwnd,
+        hinstance,
+        "Hotkeys",
+        LEFT_LABEL_X,
+        y,
+        LEFT_LABEL_X + LABEL_W + LEFT_FIELD_W,
+    );
+    y += SECTION_H;
 
-    create_label(hwnd, hinstance, "Pick element:", y);
+    create_label(hwnd, hinstance, "Pick element:", LEFT_LABEL_X, y);
     let pick_element = create_edit(
         hwnd,
         hinstance,
         &initial.hotkeys.pick_element,
         ID_PICK_ELEMENT,
+        LEFT_FIELD_X,
         y,
+        LEFT_FIELD_W,
     );
+    add_tip(tooltip, hwnd, pick_element, tips::PICK_ELEMENT);
     y += ROW_H;
 
-    create_label(hwnd, hinstance, "Pick window:", y);
+    create_label(hwnd, hinstance, "Pick window:", LEFT_LABEL_X, y);
     let pick_window = create_edit(
         hwnd,
         hinstance,
         &initial.hotkeys.pick_window,
         ID_PICK_WINDOW,
+        LEFT_FIELD_X,
         y,
+        LEFT_FIELD_W,
     );
-    y += ROW_H + PADDING;
+    add_tip(tooltip, hwnd, pick_window, tips::PICK_WINDOW);
+    y += ROW_H;
 
-    create_section_label(hwnd, hinstance, "Hints", y);
-    y += 22;
+    create_label(hwnd, hinstance, "Open settings:", LEFT_LABEL_X, y);
+    let open_settings = create_edit(
+        hwnd,
+        hinstance,
+        &initial.hotkeys.open_settings,
+        ID_OPEN_SETTINGS,
+        LEFT_FIELD_X,
+        y,
+        LEFT_FIELD_W,
+    );
+    add_tip(tooltip, hwnd, open_settings, tips::OPEN_SETTINGS);
+    y += ROW_H + SECTION_GAP;
 
-    create_label(hwnd, hinstance, "Alphabet:", y);
-    let alphabet = create_edit(hwnd, hinstance, &initial.hints.alphabet, ID_ALPHABET, y);
-    y += ROW_H + PADDING;
+    create_section(
+        hwnd,
+        hinstance,
+        "Hints",
+        LEFT_LABEL_X,
+        y,
+        LEFT_LABEL_X + LABEL_W + LEFT_FIELD_W,
+    );
+    y += SECTION_H;
 
-    create_section_label(hwnd, hinstance, "Colors (#RRGGBB)", y);
-    y += 22;
+    create_label(hwnd, hinstance, "Strategy:", LEFT_LABEL_X, y);
+    let hint_strategy = create_combo(
+        hwnd,
+        hinstance,
+        STRATEGY_OPTIONS.iter().map(|(_, label)| *label),
+        STRATEGY_OPTIONS
+            .iter()
+            .position(|(s, _)| *s == initial.hints.strategy)
+            .unwrap_or(0),
+        ID_HINT_STRATEGY,
+        LEFT_FIELD_X,
+        y,
+        LEFT_FIELD_W,
+    );
+    add_tip(tooltip, hwnd, hint_strategy, tips::STRATEGY);
+    y += ROW_H;
 
-    create_label(hwnd, hinstance, "Element badge bg:", y);
+    create_label(hwnd, hinstance, "Alphabet preset:", LEFT_LABEL_X, y);
+    let alphabet_preset = create_combo(
+        hwnd,
+        hinstance,
+        ALL_PRESETS
+            .iter()
+            .map(|p| alphabet_presets::preset_label(*p)),
+        ALL_PRESETS
+            .iter()
+            .position(|p| *p == initial.hints.preset)
+            .unwrap_or(0),
+        ID_ALPHABET_PRESET,
+        LEFT_FIELD_X,
+        y,
+        LEFT_FIELD_W,
+    );
+    add_tip(tooltip, hwnd, alphabet_preset, tips::PRESET);
+    y += ROW_H;
+
+    create_label(hwnd, hinstance, "Custom alphabet:", LEFT_LABEL_X, y);
+    let alphabet = create_edit(
+        hwnd,
+        hinstance,
+        &initial.hints.alphabet,
+        ID_ALPHABET,
+        LEFT_FIELD_X,
+        y,
+        LEFT_FIELD_W,
+    );
+    add_tip(tooltip, hwnd, alphabet, tips::ALPHABET);
+    y += ROW_H;
+
+    create_label(hwnd, hinstance, "Custom additions:", LEFT_LABEL_X, y);
+    let custom_additions = create_edit(
+        hwnd,
+        hinstance,
+        &initial.hints.custom_additions,
+        ID_CUSTOM_ADDITIONS,
+        LEFT_FIELD_X,
+        y,
+        LEFT_FIELD_W,
+    );
+    add_tip(tooltip, hwnd, custom_additions, tips::CUSTOM_ADDITIONS);
+    y += ROW_H;
+
+    let column_w = LABEL_W + LEFT_FIELD_W + 4;
+    let include_numbers = create_checkbox(
+        hwnd,
+        hinstance,
+        "Include numbers (0-9)",
+        initial.hints.include_numbers,
+        ID_INCLUDE_NUMBERS,
+        LEFT_LABEL_X,
+        y,
+        column_w,
+    );
+    add_tip(tooltip, hwnd, include_numbers, tips::INCLUDE_NUMBERS);
+    y += ROW_H;
+    let include_extended = create_checkbox(
+        hwnd,
+        hinstance,
+        "Include extended keys (; ')",
+        initial.hints.include_extended,
+        ID_INCLUDE_EXTENDED,
+        LEFT_LABEL_X,
+        y,
+        column_w,
+    );
+    add_tip(tooltip, hwnd, include_extended, tips::INCLUDE_EXTENDED);
+    y += ROW_H;
+    let exclude_ambiguous = create_checkbox(
+        hwnd,
+        hinstance,
+        "Exclude ambiguous (O 0)",
+        initial.hints.exclude_ambiguous,
+        ID_EXCLUDE_AMBIGUOUS,
+        LEFT_LABEL_X,
+        y,
+        column_w,
+    );
+    add_tip(tooltip, hwnd, exclude_ambiguous, tips::EXCLUDE_AMBIGUOUS);
+    y += ROW_H;
+
+    create_label(hwnd, hinstance, "Min single-key:", LEFT_LABEL_X, y);
+    let min_singles = create_spinner(
+        hwnd,
+        hinstance,
+        ID_MIN_SINGLES,
+        ID_MIN_SINGLES_UD,
+        LEFT_FIELD_X,
+        y,
+        80,
+        0,
+        99,
+        initial.hints.min_singles as i32,
+    );
+    add_tip(tooltip, hwnd, min_singles, tips::MIN_SINGLES);
+
+    // ──────────────── RIGHT COLUMN ────────────────
+    let mut y = PADDING;
+    let right_col_end = RIGHT_LABEL_X + LABEL_W + RIGHT_FIELD_W;
+
+    create_section(
+        hwnd,
+        hinstance,
+        "Colors (#RRGGBB)",
+        RIGHT_LABEL_X,
+        y,
+        right_col_end,
+    );
+    y += SECTION_H;
+
+    create_label(hwnd, hinstance, "Element badge bg:", RIGHT_LABEL_X, y);
+    let element_bg_initial = color_or_default(&initial.colors.element.badge_bg, "#FFE500");
     let element_bg = create_edit(
         hwnd,
         hinstance,
-        &color_or_default(&initial.colors.element.badge_bg, "#FFE500"),
+        &element_bg_initial,
         ID_ELEMENT_BG,
+        RIGHT_FIELD_X,
+        y,
+        RIGHT_FIELD_W - SWATCH_W - 4,
+    );
+    create_swatch_button(
+        hwnd,
+        hinstance,
+        ID_ELEMENT_BG_SWATCH,
+        RIGHT_FIELD_X + RIGHT_FIELD_W - SWATCH_W,
         y,
     );
+    add_tip(tooltip, hwnd, element_bg, tips::ELEMENT_BG);
     y += ROW_H;
 
-    create_label(hwnd, hinstance, "Window badge bg:", y);
+    create_label(hwnd, hinstance, "Window badge bg:", RIGHT_LABEL_X, y);
+    let window_bg_initial = color_or_default(&initial.colors.window.badge_bg, "#33AAFF");
     let window_bg = create_edit(
         hwnd,
         hinstance,
-        &color_or_default(&initial.colors.window.badge_bg, "#33AAFF"),
+        &window_bg_initial,
         ID_WINDOW_BG,
+        RIGHT_FIELD_X,
         y,
+        RIGHT_FIELD_W - SWATCH_W - 4,
     );
-    y += ROW_H + PADDING;
-
-    create_section_label(hwnd, hinstance, "Opacity (0-100, 0 = preset default)", y);
-    y += 22;
-
-    create_label(hwnd, hinstance, "Element opacity:", y);
-    let element_opacity = create_edit(
+    create_swatch_button(
         hwnd,
         hinstance,
-        &opacity_or_blank(initial.colors.element.opacity),
-        ID_ELEMENT_OPACITY,
+        ID_WINDOW_BG_SWATCH,
+        RIGHT_FIELD_X + RIGHT_FIELD_W - SWATCH_W,
         y,
     );
+    add_tip(tooltip, hwnd, window_bg, tips::WINDOW_BG);
+    y += ROW_H + SECTION_GAP;
+
+    create_section(hwnd, hinstance, "Opacity", RIGHT_LABEL_X, y, right_col_end);
+    y += SECTION_H;
+
+    let value_label_w = 36;
+    let track_w = RIGHT_FIELD_W - value_label_w - 4;
+    create_label(hwnd, hinstance, "Element opacity:", RIGHT_LABEL_X, y);
+    let element_opacity = create_trackbar(
+        hwnd,
+        hinstance,
+        ID_ELEMENT_OPACITY,
+        RIGHT_FIELD_X,
+        y,
+        track_w,
+        initial.colors.element.opacity as i32,
+    );
+    create_value_label(
+        hwnd,
+        hinstance,
+        ID_ELEMENT_OPACITY_LABEL,
+        &format!("{}", initial.colors.element.opacity),
+        RIGHT_FIELD_X + track_w + 4,
+        y,
+        value_label_w,
+    );
+    add_tip(tooltip, hwnd, element_opacity, tips::ELEMENT_OPACITY);
     y += ROW_H;
 
-    create_label(hwnd, hinstance, "Window opacity:", y);
-    let window_opacity = create_edit(
+    create_label(hwnd, hinstance, "Window opacity:", RIGHT_LABEL_X, y);
+    let window_opacity = create_trackbar(
         hwnd,
         hinstance,
-        &opacity_or_blank(initial.colors.window.opacity),
         ID_WINDOW_OPACITY,
+        RIGHT_FIELD_X,
         y,
+        track_w,
+        initial.colors.window.opacity as i32,
     );
-    y += ROW_H + PADDING;
+    create_value_label(
+        hwnd,
+        hinstance,
+        ID_WINDOW_OPACITY_LABEL,
+        &format!("{}", initial.colors.window.opacity),
+        RIGHT_FIELD_X + track_w + 4,
+        y,
+        value_label_w,
+    );
+    add_tip(tooltip, hwnd, window_opacity, tips::WINDOW_OPACITY);
+    y += ROW_H;
 
-    // Single source of truth for the leader pref: if either picker has
-    // an explicit value set, surface that (preferring `element` since
-    // that's where the feature is most visible). When both are `None`,
-    // the checkbox starts in its preset-default state (on).
     let initial_show_leader = initial
         .colors
         .element
         .show_leader
         .or(initial.colors.window.show_leader);
     let show_leader_checked = initial_show_leader.unwrap_or(true);
+    let right_column_w = LABEL_W + RIGHT_FIELD_W + 4;
     let show_leader = create_checkbox(
         hwnd,
         hinstance,
-        "Draw arrow from each badge to its target element",
+        "Draw arrow from badge to target",
         show_leader_checked,
         ID_SHOW_LEADER,
+        RIGHT_LABEL_X,
         y,
+        right_column_w,
     );
-    y += ROW_H + PADDING;
+    add_tip(tooltip, hwnd, show_leader, tips::SHOW_LEADER);
+    y += ROW_H + SECTION_GAP;
+
+    create_section(hwnd, hinstance, "Scope", RIGHT_LABEL_X, y, right_col_end);
+    y += SECTION_H;
+
+    create_label(hwnd, hinstance, "Target windows:", RIGHT_LABEL_X, y);
+    let scope_mode = create_combo(
+        hwnd,
+        hinstance,
+        SCOPE_OPTIONS.iter().map(|(_, label)| *label),
+        SCOPE_OPTIONS
+            .iter()
+            .position(|(m, _)| *m == initial.scope.mode)
+            .unwrap_or(0),
+        ID_SCOPE_MODE,
+        RIGHT_FIELD_X,
+        y,
+        RIGHT_FIELD_W,
+    );
+    add_tip(tooltip, hwnd, scope_mode, tips::SCOPE);
+    y += ROW_H;
+
+    create_label(hwnd, hinstance, "Max elements:", RIGHT_LABEL_X, y);
+    let max_elements = create_spinner(
+        hwnd,
+        hinstance,
+        ID_MAX_ELEMENTS,
+        ID_MAX_ELEMENTS_UD,
+        RIGHT_FIELD_X,
+        y,
+        100,
+        1,
+        9999,
+        initial.scope.max_elements as i32,
+    );
+    add_tip(tooltip, hwnd, max_elements, tips::MAX_ELEMENTS);
+    y += ROW_H + SECTION_GAP;
+
+    create_section(
+        hwnd,
+        hinstance,
+        "Performance",
+        RIGHT_LABEL_X,
+        y,
+        right_col_end,
+    );
+    y += SECTION_H;
+
+    let enable_caching = create_checkbox(
+        hwnd,
+        hinstance,
+        "Cache element enumeration",
+        initial.performance.enable_caching,
+        ID_ENABLE_CACHING,
+        RIGHT_LABEL_X,
+        y,
+        right_column_w,
+    );
+    add_tip(tooltip, hwnd, enable_caching, tips::ENABLE_CACHING);
+    y += ROW_H;
+
+    create_label(hwnd, hinstance, "Cache TTL (ms):", RIGHT_LABEL_X, y);
+    let cache_ttl_ms = create_spinner(
+        hwnd,
+        hinstance,
+        ID_CACHE_TTL_MS,
+        ID_CACHE_TTL_UD,
+        RIGHT_FIELD_X,
+        y,
+        100,
+        0,
+        60_000,
+        initial.performance.cache_ttl_ms as i32,
+    );
+    add_tip(tooltip, hwnd, cache_ttl_ms, tips::CACHE_TTL);
+    y += ROW_H + SECTION_GAP;
 
     let startup_now = startup::is_enabled().unwrap_or(initial.startup.launch_at_startup);
     let launch_startup = create_checkbox(
@@ -274,42 +798,72 @@ unsafe fn build_controls(hwnd: HWND, hinstance: HINSTANCE, initial: &Config) {
         "Launch keyhop at Windows startup",
         startup_now,
         ID_LAUNCH_STARTUP,
+        RIGHT_LABEL_X,
         y,
+        right_column_w,
     );
-    y += ROW_H + PADDING * 2;
+    add_tip(tooltip, hwnd, launch_startup, tips::LAUNCH_STARTUP);
 
-    create_button(hwnd, hinstance, "Save", ID_SAVE, PADDING, y, true);
-    create_button(
+    // ──────────────── BUTTON ROW ────────────────
+    // Anchor to the bottom of the inner client area so resizing the
+    // window (if we ever add it) doesn't strand the buttons.
+    let button_y = WINDOW_H - 76;
+    let button_w = 140;
+    let button_gap = 12;
+    let total_w = button_w * 3 + button_gap * 2;
+    let button_x = (WINDOW_W - total_w) / 2;
+
+    let save_btn = create_button(
+        hwnd, hinstance, "Save", ID_SAVE, button_x, button_y, button_w, true,
+    );
+    let cancel_btn = create_button(
         hwnd,
         hinstance,
         "Cancel",
         ID_CANCEL,
-        PADDING + 130,
-        y,
+        button_x + button_w + button_gap,
+        button_y,
+        button_w,
         false,
     );
-    create_button(
+    let reset_btn = create_button(
         hwnd,
         hinstance,
         "Reset to Defaults",
         ID_RESET,
-        PADDING + 260,
-        y,
+        button_x + (button_w + button_gap) * 2,
+        button_y,
+        button_w,
         false,
     );
+    add_tip(tooltip, hwnd, save_btn, tips::SAVE);
+    add_tip(tooltip, hwnd, cancel_btn, tips::CANCEL);
+    add_tip(tooltip, hwnd, reset_btn, tips::RESET);
 
     let state = Box::new(State {
         pick_element,
         pick_window,
+        open_settings,
         alphabet,
+        hint_strategy,
+        alphabet_preset,
+        include_numbers,
+        include_extended,
+        exclude_ambiguous,
+        custom_additions,
+        min_singles,
         element_bg,
         window_bg,
         element_opacity,
         window_opacity,
         show_leader,
+        scope_mode,
+        max_elements,
+        enable_caching,
+        cache_ttl_ms,
         launch_startup,
         initial_show_leader,
-        saved: false,
+        saved_config: None,
     });
     STATE.with(|s| *s.borrow_mut() = Some(state));
 }
@@ -322,41 +876,25 @@ fn color_or_default(value: &str, default_hex: &str) -> String {
     }
 }
 
-/// Render a 0..=100 opacity value into the edit field. `0` is the
-/// "use preset default" sentinel and is shown as an empty string so
-/// users see a clean field rather than a confusing zero.
-fn opacity_or_blank(value: u8) -> String {
-    if value == 0 {
-        String::new()
-    } else {
-        value.to_string()
-    }
-}
+// ──────────────────── Win32 control helpers ────────────────────
 
-/// Parse the opacity edit field back into the 0..=100 representation.
-/// Empty strings (and anything unparseable) become `0` = "preset
-/// default", matching what the placeholder text implies.
-fn parse_opacity(text: &str) -> u8 {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return 0;
-    }
-    trimmed
-        .parse::<u32>()
-        .map(|v| v.min(100) as u8)
-        .unwrap_or(0)
-}
-
-unsafe fn create_section_label(parent: HWND, hinstance: HINSTANCE, text: &str, y: i32) {
+unsafe fn create_section(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    text: &str,
+    x: i32,
+    y: i32,
+    end_x: i32,
+) {
     let text_w = to_wide(text);
     let _ = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("STATIC"),
         PCWSTR(text_w.as_ptr()),
         WS_CHILD | WS_VISIBLE,
-        PADDING,
+        x,
         y,
-        WINDOW_W - PADDING * 2,
+        end_x - x,
         20,
         parent,
         HMENU::default(),
@@ -365,15 +903,15 @@ unsafe fn create_section_label(parent: HWND, hinstance: HINSTANCE, text: &str, y
     );
 }
 
-unsafe fn create_label(parent: HWND, hinstance: HINSTANCE, text: &str, y: i32) {
+unsafe fn create_label(parent: HWND, hinstance: HINSTANCE, text: &str, x: i32, y: i32) {
     let text_w = to_wide(text);
     let _ = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("STATIC"),
         PCWSTR(text_w.as_ptr()),
-        WS_CHILD | WS_VISIBLE,
-        PADDING,
-        y + 4,
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT_STYLE),
+        x,
+        y + 6,
         LABEL_W,
         20,
         parent,
@@ -383,12 +921,41 @@ unsafe fn create_label(parent: HWND, hinstance: HINSTANCE, text: &str, y: i32) {
     );
 }
 
+unsafe fn create_value_label(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    id: usize,
+    text: &str,
+    x: i32,
+    y: i32,
+    w: i32,
+) -> HWND {
+    let text_w = to_wide(text);
+    CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("STATIC"),
+        PCWSTR(text_w.as_ptr()),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT_STYLE),
+        x,
+        y + 6,
+        w,
+        20,
+        parent,
+        HMENU(id as *mut c_void),
+        hinstance,
+        None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()))
+}
+
 unsafe fn create_edit(
     parent: HWND,
     hinstance: HINSTANCE,
     initial_text: &str,
     id: usize,
+    x: i32,
     y: i32,
+    w: i32,
 ) -> HWND {
     let text_w = to_wide(initial_text);
     CreateWindowExW(
@@ -400,9 +967,9 @@ unsafe fn create_edit(
             | WS_BORDER
             | WS_TABSTOP
             | WINDOW_STYLE((ES_AUTOHSCROLL | ES_LEFT) as u32),
-        FIELD_X,
+        x,
         y,
-        FIELD_W,
+        w,
         24,
         parent,
         HMENU(id as *mut c_void),
@@ -412,13 +979,16 @@ unsafe fn create_edit(
     .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_checkbox(
     parent: HWND,
     hinstance: HINSTANCE,
     text: &str,
     checked: bool,
     id: usize,
+    x: i32,
     y: i32,
+    w: i32,
 ) -> HWND {
     let text_w = to_wide(text);
     let hwnd = CreateWindowExW(
@@ -426,9 +996,9 @@ unsafe fn create_checkbox(
         w!("BUTTON"),
         PCWSTR(text_w.as_ptr()),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-        PADDING,
-        y,
-        WINDOW_W - PADDING * 2,
+        x,
+        y + 4,
+        w,
         24,
         parent,
         HMENU(id as *mut c_void),
@@ -442,6 +1012,54 @@ unsafe fn create_checkbox(
     hwnd
 }
 
+/// Create a non-editable dropdown (CBS_DROPDOWNLIST) with the given
+/// items and pre-select `selected_index`. Returns the combobox HWND so
+/// the caller can read the active selection on Save.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_combo<'a, I: IntoIterator<Item = &'a str>>(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    items: I,
+    selected_index: usize,
+    id: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+) -> HWND {
+    let style = CBS_DROPDOWNLIST | CBS_HASSTRINGS;
+    let height = 200;
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("COMBOBOX"),
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE(style as u32),
+        x,
+        y,
+        w,
+        height,
+        parent,
+        HMENU(id as *mut c_void),
+        hinstance,
+        None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()));
+    if hwnd.0.is_null() {
+        return hwnd;
+    }
+    for item in items {
+        let wide = to_wide(item);
+        SendMessageW(
+            hwnd,
+            CB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(wide.as_ptr() as isize),
+        );
+    }
+    SendMessageW(hwnd, CB_SETCURSEL, WPARAM(selected_index), LPARAM(0));
+    hwnd
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_button(
     parent: HWND,
     hinstance: HINSTANCE,
@@ -449,27 +1067,193 @@ unsafe fn create_button(
     id: usize,
     x: i32,
     y: i32,
+    w: i32,
     default: bool,
-) {
+) -> HWND {
     let text_w = to_wide(text);
     let style_bits = if default {
         BS_DEFPUSHBUTTON
     } else {
         BS_PUSHBUTTON
     };
-    let _ = CreateWindowExW(
+    CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("BUTTON"),
         PCWSTR(text_w.as_ptr()),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(style_bits as u32),
         x,
         y,
-        120,
+        w,
         30,
         parent,
         HMENU(id as *mut c_void),
         hinstance,
         None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()))
+}
+
+/// Owner-drawn color swatch button. We hand-paint it in
+/// [`window_proc`]'s `WM_DRAWITEM` handler by reading the *adjacent*
+/// edit field's text on each repaint, so the swatch always reflects
+/// whatever the user typed without an extra state field. Clicking it
+/// opens [`ChooseColorW`].
+unsafe fn create_swatch_button(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    id: usize,
+    x: i32,
+    y: i32,
+) -> HWND {
+    CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
+        x,
+        y,
+        SWATCH_W,
+        24,
+        parent,
+        HMENU(id as *mut c_void),
+        hinstance,
+        None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()))
+}
+
+/// Horizontal trackbar (`msctls_trackbar32`) with a fixed 0..=100
+/// range tuned for opacity. WM_HSCROLL events flow back to the
+/// parent's window proc for the live-update sibling label.
+unsafe fn create_trackbar(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    id: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+    initial: i32,
+) -> HWND {
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        TRACKBAR_CLASS,
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(TBS_HORZ | TBS_AUTOTICKS),
+        x,
+        y + 2,
+        w,
+        28,
+        parent,
+        HMENU(id as *mut c_void),
+        hinstance,
+        None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()));
+    if hwnd.0.is_null() {
+        return hwnd;
+    }
+    // Range encoded as MAKELONG(min, max) per TBM_SETRANGE convention.
+    let range = (0i16 as u16 as i32) | ((100i32) << 16);
+    SendMessageW(hwnd, TBM_SETRANGE, WPARAM(1), LPARAM(range as isize));
+    SendMessageW(hwnd, TBM_SETPAGESIZE, WPARAM(0), LPARAM(10));
+    SendMessageW(hwnd, TBM_SETTICFREQ, WPARAM(10), LPARAM(0));
+    SendMessageW(
+        hwnd,
+        TBM_SETPOS,
+        WPARAM(1),
+        LPARAM(initial.clamp(0, 100) as isize),
+    );
+    hwnd
+}
+
+/// Bounded integer spinner: an [edit | ▲▼] composite where the
+/// UpDown is an `msctls_updown32` control auto-buddied to the edit
+/// field created immediately before it. The returned HWND is the
+/// **spinner** (read with `UDM_GETPOS32`), not the edit; UDS_SETBUDDYINT
+/// keeps the edit text in sync with the spinner's integer value.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_spinner(
+    parent: HWND,
+    hinstance: HINSTANCE,
+    edit_id: usize,
+    spinner_id: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+    min: i32,
+    max: i32,
+    initial: i32,
+) -> HWND {
+    let _edit = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("EDIT"),
+        PCWSTR::null(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_BORDER
+            | WS_TABSTOP
+            | WINDOW_STYLE((ES_AUTOHSCROLL | ES_NUMBER | ES_LEFT) as u32),
+        x,
+        y,
+        w,
+        24,
+        parent,
+        HMENU(edit_id as *mut c_void),
+        hinstance,
+        None,
+    );
+    let spinner = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        UPDOWN_CLASS,
+        PCWSTR::null(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WINDOW_STYLE(UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS),
+        0,
+        0,
+        0,
+        0,
+        parent,
+        HMENU(spinner_id as *mut c_void),
+        hinstance,
+        None,
+    )
+    .unwrap_or(HWND(std::ptr::null_mut()));
+    if spinner.0.is_null() {
+        return spinner;
+    }
+    SendMessageW(
+        spinner,
+        UDM_SETRANGE32,
+        WPARAM(min as usize),
+        LPARAM(max as isize),
+    );
+    SendMessageW(spinner, UDM_SETPOS32, WPARAM(0), LPARAM(initial as isize));
+    spinner
+}
+
+/// Register `tool_hwnd` with `tooltip` so hovering the tool surfaces
+/// `text` after the system's tooltip delay. `TTF_SUBCLASS` lets the
+/// tooltip control auto-handle WM_MOUSEMOVE on the tool — we don't
+/// have to forward events manually.
+unsafe fn add_tip(tooltip: HWND, parent: HWND, tool: HWND, text: &str) {
+    if tooltip.0.is_null() || tool.0.is_null() {
+        return;
+    }
+    let mut text_w = to_wide(text);
+    let mut ti = TTTOOLINFOW {
+        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TOOLTIP_FLAGS(TTF_IDISHWND.0 | TTF_SUBCLASS.0),
+        hwnd: parent,
+        uId: tool.0 as usize,
+        lpszText: PWSTR(text_w.as_mut_ptr()),
+        ..Default::default()
+    };
+    SendMessageW(
+        tooltip,
+        TTM_ADDTOOLW,
+        WPARAM(0),
+        LPARAM(&mut ti as *mut _ as isize),
     );
 }
 
@@ -490,20 +1274,174 @@ unsafe extern "system" fn window_proc(
                         let _ = DestroyWindow(hwnd);
                     }
                     ID_RESET => on_reset(hwnd),
+                    other if is_swatch_id(other) => on_swatch_clicked(hwnd, other),
                     _ => {}
                 }
             }
             LRESULT(0)
         }
+        // Trackbar drags / arrow keys arrive as WM_HSCROLL on the
+        // *parent*. We mirror the new position into the sibling
+        // value-label so the user sees the number live as they drag.
+        WM_HSCROLL => {
+            let track_hwnd = HWND(lparam.0 as *mut c_void);
+            update_trackbar_label(hwnd, track_hwnd);
+            LRESULT(0)
+        }
+        // Owner-drawn swatch buttons. We paint the rectangle with the
+        // color the adjacent edit field currently holds, so editing
+        // the hex updates the swatch with no extra plumbing.
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            let id = dis.CtlID as usize;
+            if is_swatch_id(id) {
+                draw_swatch(dis);
+                return LRESULT(1);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            // Close the settings window when Escape is pressed
+            if wparam.0 as u16 == VK_ESCAPE.0 {
+                let _ = DestroyWindow(hwnd);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
             PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Paint a swatch button with the color encoded in its sibling
+/// edit field. Falls back to a white rectangle when the hex parse
+/// fails so the button stays visible (instead of the system
+/// default gradient, which would suggest "no color set").
+unsafe fn draw_swatch(dis: &DRAWITEMSTRUCT) {
+    let id = dis.CtlID as usize;
+    let edit_id = swatch_to_edit_id(id);
+    let swatch_hwnd = dis.hwndItem;
+    let parent_window = GetParent(swatch_hwnd).unwrap_or(HWND(std::ptr::null_mut()));
+    let edit_hwnd = GetDlgItem(parent_window, edit_id as i32).unwrap_or(HWND(std::ptr::null_mut()));
+    let hex = if edit_hwnd.0.is_null() {
+        String::new()
+    } else {
+        read_text(edit_hwnd)
+    };
+    let rgb = match overlay::parse_hex_color(&hex) {
+        // overlay::parse_hex_color returns COLORREF in 0x00BBGGRR
+        // already, which is exactly what FillRect wants.
+        Ok(c) => COLORREF(c.0 & 0x00FF_FFFF),
+        Err(_) => COLORREF(0x00FFFFFF),
+    };
+    let brush = CreateSolidBrush(rgb);
+    if !brush.is_invalid() {
+        FillRect(dis.hDC, &dis.rcItem, brush);
+        let _ = DeleteObject(brush);
+    }
+    // 1px frame so the swatch reads as a clickable control even when
+    // its colour matches the dialog's white background.
+    let frame_brush = CreateSolidBrush(COLORREF(0x00808080));
+    if !frame_brush.is_invalid() {
+        FrameRect(dis.hDC, &dis.rcItem, frame_brush);
+        let _ = DeleteObject(frame_brush);
+    }
+}
+
+/// Map a swatch button id back to the edit-field id whose text it
+/// mirrors. Centralising the pairing here means the WM_DRAWITEM and
+/// click handlers never disagree.
+fn swatch_to_edit_id(swatch_id: usize) -> usize {
+    match swatch_id {
+        ID_ELEMENT_BG_SWATCH => ID_ELEMENT_BG,
+        ID_WINDOW_BG_SWATCH => ID_WINDOW_BG,
+        _ => swatch_id,
+    }
+}
+
+/// Open `ChooseColorW` with the swatch's current color as the seed,
+/// and write the picked color back to the sibling edit field on OK.
+/// `InvalidateRect`-ing the swatch forces an immediate repaint with
+/// the new colour.
+unsafe fn on_swatch_clicked(parent: HWND, swatch_id: usize) {
+    let edit_id = swatch_to_edit_id(swatch_id);
+    let edit_hwnd = match GetDlgItem(parent, edit_id as i32) {
+        Ok(h) if !h.0.is_null() => h,
+        _ => return,
+    };
+    let initial_hex = read_text(edit_hwnd);
+    let initial_rgb = overlay::parse_hex_color(&initial_hex)
+        .map(|c| c.0 & 0x00FF_FFFF)
+        .unwrap_or(0x00FFFFFF);
+    // ChooseColorW requires a writable 16-element COLORREF table for
+    // user-defined "custom" colors; we don't persist them between
+    // openings (could be added if requested) but the API insists on
+    // a buffer regardless.
+    let mut custom: [COLORREF; 16] = [COLORREF(0xFFFFFF); 16];
+    let mut cc = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: parent,
+        rgbResult: COLORREF(initial_rgb),
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_FULLOPEN | CC_RGBINIT,
+        ..Default::default()
+    };
+    let picked = ChooseColorW(&mut cc).as_bool();
+    if !picked {
+        return;
+    }
+    // ChooseColorW returns the value as 0x00BBGGRR (Windows COLORREF),
+    // but our config stores #RRGGBB. Swap the byte order.
+    let bgr = cc.rgbResult.0;
+    let r = bgr & 0xFF;
+    let g = (bgr >> 8) & 0xFF;
+    let b = (bgr >> 16) & 0xFF;
+    let hex = format!("#{:02X}{:02X}{:02X}", r, g, b);
+    let hex_w = to_wide(&hex);
+    let _ = SetWindowTextW(edit_hwnd, PCWSTR(hex_w.as_ptr()));
+    if let Ok(swatch_hwnd) = GetDlgItem(parent, swatch_id as i32) {
+        if !swatch_hwnd.0.is_null() {
+            let _ = InvalidateRect(swatch_hwnd, None, true);
+        }
+    }
+}
+
+/// On every drag/keystroke of a trackbar, refresh the matching
+/// numeric label so the user sees the current value without having
+/// to release the slider. Unknown trackbar HWNDs are silently
+/// ignored — better than crashing if a future control sneaks past.
+unsafe fn update_trackbar_label(parent: HWND, track: HWND) {
+    if track.0.is_null() {
+        return;
+    }
+    let pos = SendMessageW(track, TBM_GETPOS, WPARAM(0), LPARAM(0)).0 as i32;
+
+    let label_id = STATE.with(|s| {
+        let st = s.borrow();
+        let st = st.as_ref()?;
+        if track == st.element_opacity {
+            Some(ID_ELEMENT_OPACITY_LABEL)
+        } else if track == st.window_opacity {
+            Some(ID_WINDOW_OPACITY_LABEL)
+        } else {
+            None
+        }
+    });
+    if let Some(id) = label_id {
+        if let Ok(label_hwnd) = GetDlgItem(parent, id as i32) {
+            if !label_hwnd.0.is_null() {
+                let text = format!("{}", pos.clamp(0, 100));
+                let text_w = to_wide(&text);
+                let _ = SetWindowTextW(label_hwnd, PCWSTR(text_w.as_ptr()));
+            }
+        }
     }
 }
 
@@ -535,28 +1473,47 @@ unsafe fn on_save(hwnd: HWND) {
 
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
-            state.saved = true;
+            state.saved_config = Some(cfg);
         }
     });
 
     let _ = DestroyWindow(hwnd);
 }
 
+/// Apply built-in defaults: delete the on-disk config (so a fresh
+/// `Config::default()` is what next launch would also see), persist
+/// a fresh `Config::default()` so the [`show`] caller can hot-apply
+/// it immediately (matching the user's expectation that "Reset"
+/// applies right now, not on next launch), and turn off the
+/// launch-at-startup registry entry to match the default `false`.
 unsafe fn on_reset(hwnd: HWND) {
+    let defaults = Config::default();
+
     if let Err(e) = Config::delete_file() {
         notification::error("Couldn't reset config", &format!("{e}"));
         return;
     }
-    if let Err(e) = startup::set_enabled(false) {
+    // Re-write defaults so any external watcher (and the next launch
+    // load path) sees a known-good file rather than relying on the
+    // implicit `Default` fallback. Best-effort: a write failure here
+    // is non-fatal because the running process gets the defaults
+    // returned regardless.
+    if let Err(e) = defaults.save() {
+        tracing::warn!(error = ?e, "couldn't re-write defaults to config.toml after reset");
+    }
+    if let Err(e) = startup::set_enabled(defaults.startup.launch_at_startup) {
         notification::warn(
             "Reset partially complete",
-            &format!("Config was deleted, but disabling startup failed:\n{e}"),
+            &format!("Config was reset, but the startup registry update failed:\n{e}"),
         );
     }
-    notification::info(
-        "Settings reset",
-        "Config file deleted. Defaults will apply on next launch.",
-    );
+
+    STATE.with(|s| {
+        if let Some(state) = s.borrow_mut().as_mut() {
+            state.saved_config = Some(defaults);
+        }
+    });
+
     let _ = DestroyWindow(hwnd);
 }
 
@@ -566,15 +1523,36 @@ fn collect_config() -> Option<(Config, bool)> {
         let st = state.as_ref()?;
         let pick_element = unsafe { read_text(st.pick_element) };
         let pick_window = unsafe { read_text(st.pick_window) };
+        let open_settings = unsafe { read_text(st.open_settings) };
         let alphabet = unsafe { read_text(st.alphabet) };
+        let custom_additions = unsafe { read_text(st.custom_additions) };
         let element_bg = unsafe { read_text(st.element_bg) };
         let window_bg = unsafe { read_text(st.window_bg) };
-        let element_opacity = parse_opacity(&unsafe { read_text(st.element_opacity) });
-        let window_opacity = parse_opacity(&unsafe { read_text(st.window_opacity) });
-        let show_leader_checked = unsafe {
-            SendMessageW(st.show_leader, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-                == BST_CHECKED.0 as isize
-        };
+        let element_opacity = unsafe { trackbar_pos(st.element_opacity) };
+        let window_opacity = unsafe { trackbar_pos(st.window_opacity) };
+        let strategy_idx = unsafe { combo_selection(st.hint_strategy) };
+        let strategy = STRATEGY_OPTIONS
+            .get(strategy_idx)
+            .map(|(s, _)| *s)
+            .unwrap_or_default();
+        let preset_idx = unsafe { combo_selection(st.alphabet_preset) };
+        let preset = ALL_PRESETS
+            .get(preset_idx)
+            .copied()
+            .unwrap_or(AlphabetPreset::HomeRow);
+        let scope_idx = unsafe { combo_selection(st.scope_mode) };
+        let scope_mode = SCOPE_OPTIONS
+            .get(scope_idx)
+            .map(|(m, _)| *m)
+            .unwrap_or_default();
+        let max_elements = unsafe { spinner_value(st.max_elements) }.max(1) as usize;
+        let cache_ttl_ms = unsafe { spinner_value(st.cache_ttl_ms) }.max(0) as u64;
+        let include_numbers = unsafe { is_checked(st.include_numbers) };
+        let include_extended = unsafe { is_checked(st.include_extended) };
+        let exclude_ambiguous = unsafe { is_checked(st.exclude_ambiguous) };
+        let min_singles = unsafe { spinner_value(st.min_singles) }.max(0) as usize;
+        let enable_caching = unsafe { is_checked(st.enable_caching) };
+        let show_leader_checked = unsafe { is_checked(st.show_leader) };
         // Keep the preset default (None) unless the user actually
         // changed the checkbox from how we showed it. This way upgrade
         // paths don't suddenly hard-pin everyone to a value, and the
@@ -585,24 +1563,47 @@ fn collect_config() -> Option<(Config, bool)> {
         } else {
             Some(show_leader_checked)
         };
-        let launch_startup = unsafe {
-            SendMessageW(st.launch_startup, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-                == BST_CHECKED.0 as isize
+        let launch_startup = unsafe { is_checked(st.launch_startup) };
+
+        // For non-Custom presets the "custom alphabet" field is a
+        // preview / power-user override only — we always rebuild the
+        // final alphabet from the preset on Save so the dropdown is
+        // the source of truth. Users wanting a fully bespoke alphabet
+        // pick the "Custom" preset, which preserves the field
+        // verbatim through `build_alphabet`.
+        let hints_partial = HintConfig {
+            alphabet: if alphabet.trim().is_empty() {
+                DEFAULT_ALPHABET.to_string()
+            } else {
+                alphabet
+            },
+            strategy,
+            preset,
+            include_numbers,
+            include_extended,
+            exclude_ambiguous,
+            custom_additions,
+            min_singles,
+        };
+        // Materialise the preset choices into a concrete alphabet
+        // string before we save. This way `config.toml` always has a
+        // ready-to-use alphabet — even if a future build can't read
+        // the preset enum (or someone hand-edits the field), the
+        // engine still gets a usable character set.
+        let resolved_alphabet = alphabet_presets::build_alphabet(&hints_partial);
+        let hints = HintConfig {
+            alphabet: resolved_alphabet,
+            ..hints_partial
         };
 
         let cfg = Config {
             hotkeys: HotkeyBindings {
                 pick_element,
                 pick_window,
+                open_settings,
             },
-            hints: HintConfig {
-                alphabet: if alphabet.trim().is_empty() {
-                    DEFAULT_ALPHABET.to_string()
-                } else {
-                    alphabet
-                },
-            },
-            colors: crate::config::ColorConfig {
+            hints,
+            colors: ColorConfig {
                 element: BadgeColors {
                     badge_bg: element_bg,
                     badge_fg: String::new(),
@@ -623,9 +1624,55 @@ fn collect_config() -> Option<(Config, bool)> {
             startup: StartupConfig {
                 launch_at_startup: launch_startup,
             },
+            scope: ScopeConfig {
+                mode: scope_mode,
+                max_elements,
+            },
+            performance: PerformanceConfig {
+                enable_caching,
+                cache_ttl_ms,
+            },
         };
         Some((cfg, launch_startup))
     })
+}
+
+/// Read the currently selected index of a CBS_DROPDOWNLIST combobox.
+/// Returns 0 when the box is empty or in error so the caller can
+/// dispatch through `STRATEGY_OPTIONS` / `SCOPE_OPTIONS` arrays
+/// without needing an Option dance.
+unsafe fn combo_selection(hwnd: HWND) -> usize {
+    let r = SendMessageW(hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0));
+    if r.0 < 0 {
+        0
+    } else {
+        r.0 as usize
+    }
+}
+
+/// True when the BS_AUTOCHECKBOX `hwnd` is currently checked.
+unsafe fn is_checked(hwnd: HWND) -> bool {
+    SendMessageW(hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED.0 as isize
+}
+
+/// Current trackbar position, clamped to the 0..=100 opacity range
+/// the dialog uses everywhere. A null HWND (e.g. trackbar creation
+/// failed) returns the "use preset default" sentinel of 0.
+unsafe fn trackbar_pos(hwnd: HWND) -> u8 {
+    if hwnd.0.is_null() {
+        return 0;
+    }
+    let raw = SendMessageW(hwnd, TBM_GETPOS, WPARAM(0), LPARAM(0)).0 as i32;
+    raw.clamp(0, 100) as u8
+}
+
+/// Current value of an UpDown spinner, read via UDM_GETPOS32 so the
+/// signed range stays intact (UDM_GETPOS would clamp to 16 bits).
+unsafe fn spinner_value(spinner: HWND) -> i32 {
+    if spinner.0.is_null() {
+        return 0;
+    }
+    SendMessageW(spinner, UDM_GETPOS32, WPARAM(0), LPARAM(0)).0 as i32
 }
 
 fn validate(cfg: &Config) -> Result<()> {
@@ -633,6 +1680,8 @@ fn validate(cfg: &Config) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Pick element hotkey is invalid:\n  {e}"))?;
     hotkey::parse_hotkey(&cfg.hotkeys.pick_window)
         .map_err(|e| anyhow::anyhow!("Pick window hotkey is invalid:\n  {e}"))?;
+    hotkey::parse_hotkey(&cfg.hotkeys.open_settings)
+        .map_err(|e| anyhow::anyhow!("Open settings hotkey is invalid:\n  {e}"))?;
 
     if cfg.hints.alphabet.trim().is_empty() {
         anyhow::bail!("Hint alphabet must not be empty.");

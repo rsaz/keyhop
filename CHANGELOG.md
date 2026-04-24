@@ -7,6 +7,215 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Splash screen** — a centered 400×400 borderless window displaying the store logo is now shown during app initialization, providing visual feedback that keyhop is loading.
+- **Store logo as tray icon** — the system tray icon now uses the official store logo instead of the procedurally generated yellow "K" badge, providing a more polished appearance.
+- **Open settings hotkey** — new global hotkey (`Ctrl+Shift+,` by default) to open the Settings dialog directly from anywhere. Previously, settings could only be opened from the tray menu.
+
+### Changed
+
+- **Settings window improvements** — the Settings dialog now opens centered on screen and always on top (topmost window). Multiple invocations (via hotkey, tray menu, or repeated clicks) now bring the existing window to the foreground instead of creating duplicate dialogs, preventing accidentally opening multiple settings windows. Press `Esc` to close the settings window (same as clicking Cancel).
+
+## [0.4.0] - 2026-04-22
+
+UX & performance release. Closes
+[#4](https://github.com/rsaz/keyhop/issues/4) ("less letters to type the
+better and multiple other issues / ideas") with six related improvements
+that work together to make the picker faster to *use* (fewer keystrokes,
+crisper labels) and faster to *run* (cached enumeration, scoped walks).
+
+### Added
+- **Variable-length hint labels (closed-form Vimium allocator).** The
+  new `HintStrategy::ShortestFirst` (default) picks the smallest label
+  length `L` such that `n^L ≥ count`, then splits the labels between
+  length `L−1` and length `L` so the average keystroke count is
+  minimised — 100 elements on the 9-char home-row alphabet fit in 78
+  length-2 + 22 length-3 labels (avg 2.22 keystrokes), where v0.3.0's
+  fixed-length scheme needed 3 keys for *every* label (avg 3.0). The
+  legacy fixed-length behaviour is still available via
+  `[hints] strategy = "fixed_length"`. The allocation guarantees no
+  label is a prefix of another, so typing `a` always commits `a` and
+  never gets stuck waiting for `aa` / `ab` — verified by regression
+  tests over counts 1 through 730.
+- **`[hints] min_singles` one-key-reach floor (default `8`).** The
+  pure average-keystroke optimum skips length-1 hints entirely once a
+  scene has more than ~73 elements on a 9-char alphabet, because
+  promoting one element to a single forces `n` length-`L` hints to
+  grow by one character. That's optimal in aggregate but
+  ergonomically surprising — users expect "shortest first" to mean
+  "at least one one-key target". `min_singles` reserves a floor of
+  length-1 hints, defaulting to `8` (= `n − 1` for the home-row
+  alphabet) so the first eight alphabet letters are always one
+  keystroke away and only the last letter is consumed as a multi-char
+  prefix. The allocator picks
+  `max(min_singles, vimium_natural_singles)` so larger alphabets that
+  already produce more singles than the floor (e.g. `alphanumeric`
+  with `count = 100` yields 13 natural singles) are never penalised.
+  Capped at `n − 1` at runtime — we always keep at least one prefix
+  slot when `count > n`. Set `min_singles = 0` in `config.toml` (or
+  via the new "Min single-key hints" Settings field) to disable the
+  floor and recover the pure math-optimal allocation.
+- **Alphabet presets** (`[hints] preset = …`):
+  `home_row` (default), `home_row_extended` (`asdfghjkl;'`),
+  `lowercase_alpha`, `alphanumeric`, `numbers`, and `custom`. Plus
+  three independent modifier flags exposed in Settings:
+    - `include_numbers` — append `0123456789`.
+    - `include_extended` — append `; '`.
+    - `exclude_ambiguous` — strip `O 0` (kept conservative; the new
+      Consolas overlay font already differentiates `I` / `l` / `1`
+      crisply, so dropping them by default would silently shrink the
+      home-row preset from 9 chars to 8).
+    - `custom_additions` — free-form characters appended after the
+      preset, useful for non-ANSI keyboards.
+  See [`src/alphabet_presets.rs`](src/alphabet_presets.rs) for the
+  builder; the Settings dialog dropdown materialises the resolved
+  alphabet on Save so `config.toml` always has a ready-to-use string.
+- **Multi-screen targeting modes.** New `[scope] mode` config:
+    - `active_window` (default — v0.3.0 behaviour, no change for
+      existing users).
+    - `active_monitor` — every visible top-level window on the
+      monitor that contains the cursor.
+    - `all_windows` — every visible top-level window across every
+      monitor, capped at `[scope] max_elements` (default 300) so a
+      busy desktop can't render thousands of badges. The foreground
+      window is always walked first, so its elements are always
+      present even when the cap kicks in.
+- **Element-tree caching.** `[performance] enable_caching = true`
+  (default) memoises [`crate::Element`] vectors per-HWND for
+  `cache_ttl_ms` (default 500ms). The "press Esc, retry" flow no
+  longer pays for a fresh UIA walk; multi-window scope modes also
+  benefit when the user fires the picker repeatedly on the same set
+  of windows. New module [`src/cache.rs`](src/cache.rs) with a
+  pluggable `Clock` so unit tests don't have to sleep.
+- **Smart multi-monitor badge positioning.** The overlay layout now
+  determines each badge's source monitor via `MonitorFromRect`, drops
+  candidate placements that would land outside the source monitor's
+  work area, and clamps any post-collision fallback back inside it.
+  The element-style picker grew an `OutsideBottom` candidate as the
+  off-element fallback when `OutsideTop` would clip off the monitor's
+  top edge. Also fixes the v0.3.0 case where an element at `y == 0`
+  on a non-primary monitor would render its `OutsideTop` badge on
+  the previous monitor (or off the virtual desktop entirely).
+- **Consolas overlay font.** Replaces the Segoe UI default for
+  hint labels. Monospace, ships with every Windows version, and
+  draws `I` / `l` / `1` distinctly — directly addresses the most
+  common "I typed the wrong letter" complaint. Falls back to the
+  closest available face if Consolas is missing.
+- **Settings dialog gained six new sections / controls**:
+  hint-strategy dropdown (Shortest first / Fixed length), alphabet
+  preset dropdown, three preset modifier checkboxes, custom-additions
+  edit field, "Min single-key hints" edit (the new `min_singles`
+  floor), scope-mode dropdown, max-elements edit, enable-caching
+  checkbox, and a cache-TTL edit. The "Exclude ambiguous characters"
+  checkbox label reads `(O 0)` to match the actual default exclusion
+  list — `I` / `l` / `1` were considered for the list but the new
+  Consolas overlay font draws them distinctly, so dropping them by
+  default would silently shrink the home-row preset from 9 chars to 8.
+- **Settings dialog UI overhaul (two-column, 860×640).** The vertical
+  scroll-pile is gone: General / Hints / Colors / Performance now sit
+  side-by-side in two columns so every option is visible without
+  scrolling. Every label has a hover **tooltip** (300 ms show / 8 s
+  linger) explaining what the setting does and what its sensible
+  range is — sourced from a single `tips` module so the wording stays
+  consistent with the README. Power-user controls were upgraded:
+    - **Color picker swatches.** Each `#RRGGBB` field grew a 28×24
+      owner-drawn swatch button to its right; clicking it opens the
+      Win32 `ChooseColorW` common dialog (with `CC_FULLOPEN` so the
+      custom-color matrix is available) and writes the selection
+      back into the hex edit. Typing into the edit still works and
+      live-updates the swatch on `EN_CHANGE`.
+    - **Opacity sliders.** Background and badge opacity are now
+      `msctls_trackbar32` trackbars (0–100, page 10, tick 10) with
+      a live "`82%`" value label that updates on `WM_HSCROLL` —
+      drag, click the trough, or arrow-key from the keyboard. The
+      old free-text "0..100 or blank" field is gone, which also
+      removes a class of typo-induced parse errors on Save.
+    - **Numeric spinners.** `min_singles`, `max_elements`, and
+      `cache_ttl_ms` are now `msctls_updown32` UpDown spinners
+      auto-buddied to their edit fields (`UDS_AUTOBUDDY |
+      UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS`), with
+      per-field min/max ranges enforced at the control level so
+      out-of-range values can't reach `Config::save`.
+- **Live config hot-reload.** Save / Reset to Defaults now apply
+  in-process — no restart, no overlay rebuild. The Settings dialog
+  returns the new `Config` to the main loop, which calls a new
+  `apply_config` helper that swaps the `HintEngine`, hint
+  styles, scope mode, `WindowsBackend` cache + max-elements, and
+  re-registers all hotkeys (dropping the old `Hotkeys` *before*
+  registering the new ones so `RegisterHotKey` doesn't trip over
+  its own per-process duplicate-chord rule). A "Settings applied"
+  toast confirms the change. Hotkey-conflict toasts continue to fire
+  if the user picks an already-claimed chord.
+- **`config.toml` file watcher.** A new
+  [`src/windows/config_watcher.rs`](src/windows/config_watcher.rs)
+  module watches `%APPDATA%\keyhop\config.toml` via the cross-platform
+  [`notify`](https://crates.io/crates/notify) crate. When the file
+  changes — whether the Settings dialog wrote it, the user
+  hand-edited it in their text editor, a cloud-sync agent dropped in
+  a new copy, or a future CLI subcommand mutated it — the watcher
+  posts a debounced (`150 ms`) `WM_USER_RELOAD_CONFIG` thread
+  message via `PostThreadMessageW` and the main loop reloads &
+  re-applies the config. The debounce window absorbs the
+  multi-write atomic-save sequence editors like VS Code, Notepad++,
+  and Vim use, so a single Save click triggers a single reload. The
+  watcher targets the parent directory (not the file itself) so
+  rename-over saves still fire the right events.
+
+### Changed
+- **`HintEngine::default()` now uses `ShortestFirst`.** The legacy
+  fixed-length behaviour stays available via
+  `HintEngine::with_strategy(alphabet, HintStrategy::FixedLength)`
+  and via `[hints] strategy = "fixed_length"` in `config.toml`.
+- **`Config` gained two new sections (`[scope]`, `[performance]`)
+  and the existing `[hints]` section gained seven new fields**
+  (`strategy`, `preset`, `include_numbers`, `include_extended`,
+  `exclude_ambiguous`, `custom_additions`, `min_singles`). All fields
+  are `serde default`, so v0.3.0 `config.toml` files continue to load
+  unchanged and just inherit the new defaults.
+- **`WindowsBackend::new()` is now a thin wrapper around
+  `WindowsBackend::with_config(enable_caching, cache_ttl_ms,
+  max_elements_global)`.** The binary uses `with_config` to thread
+  the new `[performance]` and `[scope]` knobs into the backend at
+  startup; library users can keep calling `new()` and get the
+  defaults (caching on, 500ms TTL, 300 element global cap).
+- **`handle_pick_element` in `main.rs` now calls
+  `backend.enumerate_by_scope(runtime.scope_mode)`** instead of the
+  hard-coded `enumerate_foreground`. The active-window scope is the
+  default, so existing users see no behaviour change.
+
+### Internals
+- New modules: [`src/alphabet_presets.rs`](src/alphabet_presets.rs),
+  [`src/cache.rs`](src/cache.rs),
+  [`src/windows/config_watcher.rs`](src/windows/config_watcher.rs).
+- New dependency: [`notify = "6"`](https://crates.io/crates/notify)
+  for the cross-platform `config.toml` file watcher (only used on
+  Windows in practice — the watcher itself is `cfg(windows)`-gated).
+- New `windows` feature flag: `Win32_UI_Controls_Dialogs` for the
+  `ChooseColorW` common dialog used by the Settings color-picker
+  swatches. Two trackbar/updown control class names and one
+  trackbar message id (`TBM_GETPOS`) are defined locally because
+  `windows` 0.58 doesn't generate them.
+- `main.rs` gained an `apply_config(new, &mut Runtime, &mut Backend,
+  &mut Hotkeys, announce)` helper that centralises every step of a
+  hot-reload (engine swap, style swap, backend reconfigure,
+  hotkey re-registration, registry sync, optional toast). Both the
+  Settings-dialog return path and the file-watcher path call it.
+- 30+ new unit tests covering: variable-length label generation
+  (single-char, mixed-length, prefix-collision invariants at scale,
+  degenerate 1-char alphabet), the alphabet builder (every preset,
+  every modifier flag combination, deduping, fallback to default on
+  empty result), the cache (TTL expiry, lazy + active sweep,
+  enable/disable, mock-clock), and the new monitor-aware layout
+  helpers (`rect_inside_monitor`, `screen_to_client_rect`, the new
+  `OutsideBottom` anchor).
+- New `windows` API surface used:
+  `Win32_Graphics_Gdi::{MonitorFromRect, GetMonitorInfoW, MONITORINFO,
+  MONITOR_DEFAULTTONEAREST}` for the monitor-aware overlay layout, plus
+  `Win32_Graphics_Gdi::{MonitorFromPoint}` and
+  `Win32_UI_WindowsAndMessaging::GetCursorPos` for the
+  active-monitor scope mode.
+
 ## [0.3.0] - 2026-04-22
 
 Browser web-content release. The element picker now actually finds the
@@ -339,7 +548,8 @@ Initial public release. Windows-only.
 - Only the `Invoke` action is dispatched. `Focus`, `Type`, and
   `Scroll` are stubs.
 
-[Unreleased]: https://github.com/rsaz/keyhop/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rsaz/keyhop/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rsaz/keyhop/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rsaz/keyhop/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rsaz/keyhop/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rsaz/keyhop/releases/tag/v0.1.0

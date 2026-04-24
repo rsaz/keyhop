@@ -6,7 +6,7 @@ dev = "cargo run"
 build = { command = "cargo build", env = { RUST_LOG = "info" } }
 release = "cargo build --release"
 install = "cargo install --path . --locked --force"
-test = { command = "cargo test", env = { RUST_LOG = "warn" } }
+test = { command = "cargo test --all-features", env = { RUST_LOG = "warn" } }
 doc = "cargo doc --no-deps --open"
 
 # ---------------------------------------------------------------------------

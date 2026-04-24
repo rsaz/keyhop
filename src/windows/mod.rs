@@ -8,30 +8,37 @@
 //! collects on-screen, interactable elements (buttons, links, inputs, menu
 //! items, ...) into the platform-agnostic [`crate::Element`] model.
 
+pub mod config_watcher;
 pub mod hotkey;
 pub mod ipc;
 pub mod notification;
 pub mod overlay;
+pub mod prewarm;
 pub mod settings_window;
 pub mod single_instance;
+pub mod splash_screen;
 pub mod startup;
 pub mod tray;
 pub mod window_picker;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Context;
+use parking_lot::Mutex;
 
 use uiautomation::{
+    core::UICacheRequest,
     patterns::{
-        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern, UIScrollPattern,
-        UISelectionItemPattern, UITogglePattern,
+        UIExpandCollapsePattern, UIInvokePattern, UILegacyIAccessiblePattern, UIPatternType,
+        UIScrollPattern, UISelectionItemPattern, UITogglePattern,
     },
-    types::{ControlType, Handle, ScrollAmount},
+    types::{ControlType, Handle, ScrollAmount, UIProperty},
     UIAutomation, UIElement, UITreeWalker,
 };
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -39,10 +46,12 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW,
-    SMTO_ABORTIFHUNG, WM_GETOBJECT,
+    EnumChildWindows, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+    SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_GETOBJECT,
 };
 
+use crate::cache::{CacheManager, WindowKey};
+use crate::config::ScopeMode;
 use crate::{Action, Backend, Bounds, Element, ElementId, Role};
 
 /// Maximum tree depth we descend into for *desktop* apps. Native Win32 /
@@ -84,6 +93,22 @@ const MAX_ELEMENTS_DESKTOP: usize = 500;
 /// signal-to-noise ratio sane at this size.
 const MAX_ELEMENTS_BROWSER: usize = 800;
 
+/// Per-window element cap applied to *non-foreground* windows in the
+/// multi-window scope modes (`ActiveMonitor`, `AllWindows`).
+///
+/// Without this, a single chatty background app — Cursor, Slack, a
+/// content-rich Outlook window — can return its full
+/// [`MAX_ELEMENTS_DESKTOP`]/[`MAX_ELEMENTS_BROWSER`] quota and starve
+/// every other visible app of badge slots, leaving the user staring at
+/// 300 hints all anchored on one monitor.
+///
+/// 80 is empirically enough to cover the visible affordances of any
+/// reasonable app at a glance, while leaving budget for ~3 other
+/// windows on the typical 3-monitor setup. The foreground window is
+/// always exempt — the user clearly cares about that one and we want
+/// to preserve every clickable on it.
+const PER_WINDOW_HINT_CAP_MULTI: usize = 80;
+
 /// Default minimum element size (in physical pixels) before we even
 /// consider a web element. Filters out the swarms of 1×1 / 4×4
 /// layout/spacer/decoration nodes that the Chromium UIA provider
@@ -117,7 +142,7 @@ const MSAA_ROLE_COMBOBOX: i32 = 0x2E;
 const MSAA_ROLE_BUTTON_DROPDOWN: i32 = 0x38;
 const MSAA_ROLE_BUTTON_MENU: i32 = 0x39;
 
-/// Bookkeeping for one [`WindowsBackend::walk`] invocation. Surfaced via
+/// Bookkeeping for one [`walk_window`] invocation. Surfaced via
 /// the debug log at the end of `enumerate_foreground` so we can tell —
 /// after the fact — whether the picker stopped because it ran out of
 /// elements, hit the depth cap, or simply found everything the tree
@@ -131,22 +156,114 @@ struct WalkStats {
     hit_element_cap: bool,
 }
 
+/// One element captured by [`walk_window`] before any backend-side
+/// bookkeeping runs. Holds everything the public `Element` needs,
+/// plus the live `UIElement` so the foreground backend can register
+/// it for [`Backend::perform`] later.
+///
+/// IDs aren't assigned at walk time: parallel pid-group walks (Phase
+/// 5) emit records on multiple threads, and we need a consistent
+/// monotonic counter across the merged result. The merge step that
+/// runs back on the main thread takes care of numbering.
+pub(crate) struct WalkRecord {
+    pub role: Role,
+    pub name: Option<String>,
+    pub bounds: Bounds,
+    pub element: UIElement,
+}
+
+/// Send-shim for [`WalkRecord`] so it can ship across rayon worker
+/// boundaries.
+///
+/// # Safety
+///
+/// `UIElement` wraps an MTA-only COM interface; the `windows`/`uiautomation`
+/// crates conservatively leave it `!Send`. We uphold the COM rule by
+/// guaranteeing every thread that ever touches one of these records —
+/// the rayon worker that constructs it and the main thread that later
+/// invokes patterns on it — has CoInitialized as MTA via
+/// `UIAutomation::new()`. Both paths satisfy that: the per-pid worker
+/// in `enumerate_windows_filtered` builds its own `UIAutomation` (which
+/// registers MTA on the worker thread), and the main thread does the
+/// same when [`WindowsBackend::with_shared_cache`] runs at startup.
+struct SendWalkRecord(WalkRecord);
+// SAFETY: see type-level comment above.
+unsafe impl Send for SendWalkRecord {}
+
 /// UI Automation-backed implementation of [`Backend`] for Windows.
 pub struct WindowsBackend {
     automation: UIAutomation,
     elements: HashMap<ElementId, UIElement>,
     next_id: u64,
-    /// Set in [`Backend::enumerate_foreground`] before walking the tree.
-    /// Drives whether the desktop or web detection path runs for each
-    /// element. Recomputed every enumeration so it tracks the user's
-    /// actual focus, not whatever was foreground when the backend was
-    /// constructed.
-    is_current_browser: bool,
+    /// Per-HWND enumeration cache. Backs the "press Esc, retry"
+    /// flow — same window, same elements, no UIA round-trip. Disabled
+    /// by setting `enable_caching = false` in `config.toml`.
+    ///
+    /// Phase 4 of the perf plan introduces a pre-warm worker thread
+    /// (`crate::windows::prewarm`) that owns its own
+    /// [`WindowsBackend`] but writes into the *same* `CacheManager`
+    /// as the synchronous hotkey path. The shared `Arc<Mutex<…>>`
+    /// makes that hand-off lock-free for readers in the common case
+    /// (`parking_lot::Mutex` is uncontended ~99 % of the time) and
+    /// keeps the cache's existing API intact — callers just go
+    /// through `self.cache.lock()` instead of touching it directly.
+    cache: Arc<Mutex<CacheManager>>,
+    /// Hard cap on elements per enumeration in non-active-window scope
+    /// modes. The single-window walk caps are
+    /// `MAX_ELEMENTS_DESKTOP`/`MAX_ELEMENTS_BROWSER`; this kicks in
+    /// only when we're aggregating across multiple windows.
+    max_elements_global: usize,
+    /// Pre-built UIA cache request that prefetches every property and
+    /// pattern the walker reads on each node. With this attached to
+    /// `element_from_handle_build_cache` and the `*_build_cache`
+    /// walker methods, every `get_cached_*` call inside `try_record*`
+    /// resolves from in-process memory instead of a cross-process COM
+    /// round-trip — the dominant cost of a UIA tree walk on real apps
+    /// (each remote get is a few-hundred-microsecond IPC). Built once
+    /// in [`Self::with_config`] and reused for every walk.
+    cache_request: UICacheRequest,
+    /// Pre-built UIA condition that pre-filters the desktop walk on
+    /// the server side: "controls of an interactable type or any
+    /// element advertising an action pattern, that is not currently
+    /// scrolled offscreen". Phase 2 of the perf plan replaces the
+    /// recursive control-view walker (one IPC per `get_first_child` /
+    /// `get_next_sibling`, N hops total) with a single
+    /// `find_all_build_cache(Subtree, …)` call against this condition,
+    /// collapsing an O(N)-IPC walk into one IPC for desktop apps.
+    /// Browser windows still go through the recursive walker because
+    /// their DOM trees over-match every generic control-type predicate.
+    desktop_condition: uiautomation::core::UICondition,
 }
 
 impl WindowsBackend {
-    /// Construct a new backend, initializing the UI Automation client.
+    /// Construct a new backend with caching enabled and the default
+    /// 500ms TTL. Use [`Self::with_config`] to override either knob.
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_config(true, 500, 300)
+    }
+
+    /// Construct a new backend, initializing the UI Automation client.
+    /// `enable_caching` and `cache_ttl_ms` configure the cache; the
+    /// Settings dialog calls [`Self::reconfigure_cache`] to flip the
+    /// switch at runtime without restarting.
+    pub fn with_config(
+        enable_caching: bool,
+        cache_ttl_ms: u64,
+        max_elements_global: usize,
+    ) -> anyhow::Result<Self> {
+        let cache = Arc::new(Mutex::new(CacheManager::new(cache_ttl_ms, enable_caching)));
+        Self::with_shared_cache(cache, max_elements_global)
+    }
+
+    /// Construct a backend whose `CacheManager` is shared with another
+    /// `WindowsBackend` (typically the pre-warm worker — see
+    /// [`crate::windows::prewarm`]). Both backends own their own
+    /// `UIAutomation` client (UIA is per-thread / per-apartment) but
+    /// hits one populates the other's cache for free.
+    pub fn with_shared_cache(
+        cache: Arc<Mutex<CacheManager>>,
+        max_elements_global: usize,
+    ) -> anyhow::Result<Self> {
         // PerMonitorV2 ensures `GetBoundingRectangle` returns physical
         // pixels matching the overlay's coordinate space on high-DPI
         // displays. Best-effort: ignore "already set" / older-OS errors.
@@ -155,20 +272,639 @@ impl WindowsBackend {
         }
 
         let automation = UIAutomation::new().context("initializing UI Automation client")?;
+        let cache_request = build_cache_request(&automation)
+            .context("building UIA cache request for prefetched properties/patterns")?;
+        let desktop_condition = build_desktop_condition(&automation)
+            .context("building UIA desktop pre-filter condition for FindAll(Subtree, …)")?;
         Ok(Self {
             automation,
             elements: HashMap::new(),
             next_id: 0,
-            is_current_browser: false,
+            cache,
+            max_elements_global,
+            cache_request,
+            desktop_condition,
         })
     }
+
+    /// Hand out a clone of the shared cache handle so the pre-warm
+    /// worker can write into the same `CacheManager` the hotkey path
+    /// reads from. Cheap (atomic refcount bump on the `Arc`).
+    pub fn cache_handle(&self) -> Arc<Mutex<CacheManager>> {
+        Arc::clone(&self.cache)
+    }
+
+    /// Mirror new cache settings from [`crate::Config`] into the live
+    /// backend without restarting. Disabling caching also clears the
+    /// existing entries.
+    pub fn reconfigure_cache(&mut self, enable_caching: bool, cache_ttl_ms: u64) {
+        self.cache.lock().reconfigure(cache_ttl_ms, enable_caching);
+    }
+
+    /// Replace the global element cap (used in multi-window scope
+    /// modes). Single-window walks still cap at the platform-specific
+    /// constants — this is purely a safety net for the aggregate.
+    pub fn set_max_elements_global(&mut self, max: usize) {
+        self.max_elements_global = max.max(1);
+    }
+
+    /// Enumerate elements scoped by [`ScopeMode`].
+    ///
+    /// - [`ScopeMode::ActiveWindow`] is exactly [`Backend::enumerate_foreground`].
+    /// - [`ScopeMode::ActiveMonitor`] enumerates every visible top-level
+    ///   window whose frame intersects the monitor under the cursor.
+    /// - [`ScopeMode::AllWindows`] enumerates every visible top-level
+    ///   window across all monitors.
+    ///
+    /// Multi-window modes aggregate per-window walks and apply the
+    /// [`Self::max_elements_global`] cap so a busy desktop can't render
+    /// thousands of badges. The cap is enforced in walk order, so the
+    /// foreground window's elements are always present.
+    pub fn enumerate_by_scope(&mut self, mode: ScopeMode) -> anyhow::Result<Vec<Element>> {
+        match mode {
+            ScopeMode::ActiveWindow => self.enumerate_foreground(),
+            ScopeMode::ActiveMonitor => self.enumerate_active_monitor(),
+            ScopeMode::AllWindows => self.enumerate_all_windows(),
+        }
+    }
+
+    fn enumerate_active_monitor(&mut self) -> anyhow::Result<Vec<Element>> {
+        let monitor_rect = current_monitor_rect();
+        // Phase 5: tightened prune. The previous "any pixel overlaps"
+        // check pulled in windows that just barely touched the cursor
+        // monitor (e.g. a sliver of an off-screen Slack window),
+        // wasting a UIA walk per spurious match. Requiring 10% area
+        // overlap drops those without losing any window the user
+        // would actually consider "on this monitor".
+        self.enumerate_windows_filtered(|bounds| {
+            rect_overlap_fraction(&monitor_rect, bounds) >= 0.10
+        })
+    }
+
+    fn enumerate_all_windows(&mut self) -> anyhow::Result<Vec<Element>> {
+        self.enumerate_windows_filtered(|_| true)
+    }
+
+    /// Shared implementation behind the multi-window scope modes.
+    ///
+    /// Phase 5: parallelize the per-window walks across rayon worker
+    /// threads, grouped by process id. Most of the time in this
+    /// function is spent waiting on COM IPC against remote app
+    /// processes, which is embarrassingly parallel — the only thing
+    /// we *can't* do is hammer two HWNDs of the same app
+    /// simultaneously (they share one UI thread on the target side),
+    /// so the pid grouping serializes per-app work onto a single
+    /// worker. The foreground window's pid group is walked locally
+    /// to keep its UIElements bound to this backend's apartment for
+    /// `perform()` (rayon workers register theirs on their own
+    /// thread, which is fine for invocation thanks to MTA marshalling
+    /// but risks subtle ordering bugs we don't need to court).
+    ///
+    /// Errors from a single window's walk are swallowed with a
+    /// `tracing` warning — better to return what we did manage to
+    /// enumerate than abort the whole pick because one tab's UIA
+    /// tree was unhealthy.
+    fn enumerate_windows_filtered<F>(&mut self, mut accept: F) -> anyhow::Result<Vec<Element>>
+    where
+        F: FnMut(&Bounds) -> bool,
+    {
+        use std::collections::BTreeMap;
+
+        let candidates = crate::windows::window_picker::enumerate_visible()
+            .context("listing top-level windows for multi-window scope")?;
+        let cap = self.max_elements_global;
+        let foreground = unsafe { GetForegroundWindow() };
+
+        // Filter + group by pid. BTreeMap so iteration order is stable
+        // across runs (helpful for test reproducibility and for
+        // attributing trace logs to specific apps). The foreground pid
+        // gets walked first; everything else fans out onto rayon.
+        //
+        // Z-order pruning: `enumerate_visible` returns windows in
+        // top-down z-order. We track the union of higher-z window
+        // bounds per monitor and skip any window whose entire frame is
+        // already covered — that window is hidden from the user, so
+        // walking it would just waste a UIA round-trip and pollute the
+        // overlay with badges the user can't see.
+        let mut by_pid: BTreeMap<u32, Vec<crate::windows::window_picker::TopLevelWindow>> =
+            BTreeMap::new();
+        let mut foreground_pid: Option<u32> = None;
+        let mut occlusion = OcclusionTracker::new();
+        for win in candidates {
+            if !accept(&win.bounds) {
+                continue;
+            }
+            // Foreground window is the user's focus; never let occlusion
+            // tracking skip it even if some popup happens to fully cover
+            // its frame for a frame.
+            if win.hwnd != foreground && occlusion.is_fully_covered(&win.bounds) {
+                tracing::debug!(?win.hwnd, title = %win.title,
+                    "skipping fully occluded window");
+                continue;
+            }
+            occlusion.record(&win.bounds);
+            let pid = window_pid(win.hwnd);
+            if win.hwnd == foreground {
+                foreground_pid = Some(pid);
+            }
+            by_pid.entry(pid).or_default().push(win);
+        }
+
+        // Walk the foreground pid group locally (sequentially through
+        // `enumerate_window`, which goes through the cache and binds
+        // UIElements into `self.elements`). This guarantees the
+        // hotkey-driven backend can invoke any element on the active
+        // window via `perform()` even if a parallel worker had
+        // pre-walked the same HWND.
+        //
+        // The foreground HWND is allowed the full per-window quota
+        // (it's the user's primary target); other windows in the same
+        // pid group share the smaller `PER_WINDOW_HINT_CAP_MULTI`
+        // budget so a single chatty app can't crowd everything else
+        // out of the overlay.
+        let mut out: Vec<Element> = Vec::with_capacity(64);
+        if let Some(pid) = foreground_pid {
+            if let Some(group) = by_pid.remove(&pid) {
+                let mut group = group;
+                group.sort_by_key(|w| if w.hwnd == foreground { 0 } else { 1 });
+                for win in group {
+                    if out.len() >= cap {
+                        break;
+                    }
+                    match self.enumerate_window(win.hwnd) {
+                        Ok(elements) => {
+                            let remaining = cap - out.len();
+                            let per_window = if win.hwnd == foreground {
+                                remaining
+                            } else {
+                                PER_WINDOW_HINT_CAP_MULTI.min(remaining)
+                            };
+                            out.extend(elements.into_iter().take(per_window));
+                        }
+                        Err(e) => {
+                            tracing::warn!(?win.hwnd, title = %win.title, error = ?e,
+                                "foreground-pid window walk failed; skipping");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remaining pid groups fan out across rayon workers. Each
+        // worker constructs its own `UIAutomation` (the `with_config`
+        // CoInitializeEx happens on the worker thread), then walks
+        // every HWND in its group. Records come back wrapped in
+        // [`SendWalkRecord`] (see safety note on that type).
+        if !by_pid.is_empty() && out.len() < cap {
+            use rayon::prelude::*;
+            let groups: Vec<(u32, Vec<crate::windows::window_picker::TopLevelWindow>)> =
+                by_pid.into_iter().collect();
+            let walked: Vec<Vec<SendWalkRecord>> = groups
+                .into_par_iter()
+                .map(|(pid, windows)| {
+                    let automation = match UIAutomation::new() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(pid, error = ?e,
+                                "rayon worker: UIAutomation init failed");
+                            return Vec::new();
+                        }
+                    };
+                    let cache_request = match build_cache_request(&automation) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(pid, error = ?e,
+                                "rayon worker: build_cache_request failed");
+                            return Vec::new();
+                        }
+                    };
+                    let desktop_condition = match build_desktop_condition(&automation) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(pid, error = ?e,
+                                "rayon worker: build_desktop_condition failed");
+                            return Vec::new();
+                        }
+                    };
+                    let mut local: Vec<SendWalkRecord> = Vec::with_capacity(64);
+                    for win in windows {
+                        let is_browser = is_browser_window(win.hwnd);
+                        match walk_window(
+                            &automation,
+                            &cache_request,
+                            &desktop_condition,
+                            win.hwnd,
+                            is_browser,
+                        ) {
+                            Ok(records) => {
+                                // Per-window cap so one busy background
+                                // window (e.g. a Cursor / VS Code with
+                                // hundreds of UIA matches) can't eat the
+                                // global budget alone, leaving the user's
+                                // other open apps unbadged on
+                                // multi-monitor setups.
+                                local.extend(
+                                    records
+                                        .into_iter()
+                                        .take(PER_WINDOW_HINT_CAP_MULTI)
+                                        .map(SendWalkRecord),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(?win.hwnd, title = %win.title, error = ?e,
+                                    "parallel window walk failed; skipping");
+                            }
+                        }
+                    }
+                    local
+                })
+                .collect();
+
+            // Merge in pid-group order so logging stays
+            // deterministic. `register_records` mints the global
+            // `ElementId`s and stuffs UIElements into `self.elements`
+            // so `perform()` works on every returned element.
+            for group in walked {
+                if out.len() >= cap {
+                    break;
+                }
+                let remaining = cap - out.len();
+                let take: Vec<WalkRecord> =
+                    group.into_iter().map(|w| w.0).take(remaining).collect();
+                let elements = self.register_records(take);
+                out.extend(elements);
+            }
+        }
+
+        tracing::info!(
+            collected = out.len(),
+            cap,
+            "enumerate_windows_filtered done"
+        );
+        Ok(out)
+    }
+
+    /// Walk a single HWND, going through the cache first. Used by the
+    /// multi-window scope modes and by the foreground path.
+    pub fn enumerate_window(&mut self, hwnd: HWND) -> anyhow::Result<Vec<Element>> {
+        let key = hwnd_to_key(hwnd);
+        if let Some(cached) = self.cache.lock().get(key) {
+            let all_known = cached.iter().all(|e| self.elements.contains_key(&e.id));
+            if all_known {
+                return Ok(cached.as_ref().to_vec());
+            }
+            // Cache hit but the IDs were minted by a different
+            // backend (the pre-warm worker, or a different per-pid
+            // worker). Fall through to a fresh walk so
+            // `self.elements` has UIElement handles bound to *this*
+            // backend for `perform()` to use.
+        }
+
+        let is_browser = is_browser_window(hwnd);
+        let records = walk_window(
+            &self.automation,
+            &self.cache_request,
+            &self.desktop_condition,
+            hwnd,
+            is_browser,
+        )?;
+        let elements = self.register_records(records);
+
+        let shared: Arc<[Element]> = Arc::from(elements.clone().into_boxed_slice());
+        self.cache.lock().insert(key, shared);
+        Ok(elements)
+    }
+
+    /// Drain a batch of [`WalkRecord`]s into `self.elements`,
+    /// minting fresh IDs and producing the public [`Element`] list
+    /// in the same order. Centralized so the foreground-,
+    /// single-window-, and multi-window-merge paths can't drift.
+    fn register_records(&mut self, records: Vec<WalkRecord>) -> Vec<Element> {
+        let mut out = Vec::with_capacity(records.len());
+        for rec in records {
+            let id = ElementId(self.next_id);
+            self.next_id = self.next_id.wrapping_add(1);
+            self.elements.insert(id, rec.element);
+            out.push(Element {
+                id,
+                role: rec.role,
+                name: rec.name,
+                bounds: rec.bounds,
+            });
+        }
+        out
+    }
+}
+
+/// Build the per-process UIA cache request once, attaching every property
+/// and pattern the walker / `try_record*` paths consult. This is the spine
+/// of Phase 1 of the perf plan: by sending the entire shopping list to UIA
+/// up front, every subsequent `get_cached_*` call reads from in-process
+/// memory instead of round-tripping to the target app's UI thread.
+///
+/// Anything fetched by the walker must be added here — the cached getter
+/// returns an error otherwise. We deliberately *over-cache* a couple of
+/// rarely-used properties (LocalizedControlType, AutomationId) so future
+/// debug logging can pick them up without forcing a re-roll of the
+/// request.
+fn build_cache_request(automation: &UIAutomation) -> uiautomation::Result<UICacheRequest> {
+    let req = automation.create_cache_request()?;
+
+    // Properties read by `try_record`, `try_record_desktop_element`,
+    // `try_record_web_element`, and `create_element`.
+    for prop in [
+        UIProperty::ControlType,
+        UIProperty::BoundingRectangle,
+        UIProperty::IsOffscreen,
+        UIProperty::IsEnabled,
+        UIProperty::IsKeyboardFocusable,
+        UIProperty::IsControlElement,
+        UIProperty::Name,
+        UIProperty::AutomationId,
+        UIProperty::LocalizedControlType,
+        UIProperty::ClassName,
+    ] {
+        req.add_property(prop)?;
+    }
+
+    // Patterns probed by `has_any_action_pattern` / `looks_clickable_web`.
+    // `Scroll` is here so that the future `Action::Scroll` path can stay
+    // on cached pattern handles too. `LegacyIAccessible` is needed because
+    // `looks_clickable_web` reads its `get_cached_role()`.
+    for pat in [
+        UIPatternType::Invoke,
+        UIPatternType::Toggle,
+        UIPatternType::SelectionItem,
+        UIPatternType::ExpandCollapse,
+        UIPatternType::LegacyIAccessible,
+        UIPatternType::Scroll,
+    ] {
+        req.add_pattern(pat)?;
+    }
+
+    Ok(req)
+}
+
+/// Build the desktop pre-filter once per backend lifetime. Phase 2 of the
+/// perf plan replaces the recursive control-view tree walk with a single
+/// `find_all_build_cache(TreeScope::Subtree, …)` call against this
+/// condition; UIA evaluates it on the target app's UI thread and ships
+/// back only the elements that match (already cached per
+/// [`build_cache_request`]).
+///
+/// Conceptually the condition is:
+///
+/// ```text
+/// And(
+///   IsControlElement = true,
+///   Or(
+///     ControlType in { Button, SplitButton, Hyperlink, Edit, MenuItem,
+///                       TabItem, CheckBox, RadioButton, ComboBox,
+///                       ListItem, TreeItem, DataItem, Image },
+///     IsInvokePatternAvailable = true,
+///     IsTogglePatternAvailable = true,
+///     IsSelectionItemPatternAvailable = true,
+///     IsExpandCollapsePatternAvailable = true,
+///   ),
+///   Not(IsOffscreen = true),
+/// )
+/// ```
+///
+/// The `uiautomation` crate exposes the boolean combinators in binary
+/// form, so the implementation reduces lists with a small `fold` helper.
+fn build_desktop_condition(
+    automation: &UIAutomation,
+) -> uiautomation::Result<uiautomation::core::UICondition> {
+    use uiautomation::core::UICondition;
+    use uiautomation::types::PropertyConditionFlags;
+    use uiautomation::variants::Variant;
+
+    fn or_all(
+        automation: &UIAutomation,
+        mut conds: Vec<UICondition>,
+    ) -> uiautomation::Result<UICondition> {
+        let mut acc = conds.remove(0);
+        for c in conds {
+            acc = automation.create_or_condition(acc, c)?;
+        }
+        Ok(acc)
+    }
+
+    let prop = |property: UIProperty, value: Variant| -> uiautomation::Result<UICondition> {
+        automation.create_property_condition(property, value, Some(PropertyConditionFlags::None))
+    };
+
+    // ControlTypes worth hinting on a desktop app. Mirrors the
+    // accept-list inside `map_role` plus `Image` (which the desktop
+    // path also accepts via the structural fallback). UIA stores
+    // ControlType as the `UIA_*ControlTypeId` integer, so we pass the
+    // enum's `i32` discriminant.
+    let ct_ids: [ControlType; 13] = [
+        ControlType::Button,
+        ControlType::SplitButton,
+        ControlType::Hyperlink,
+        ControlType::Edit,
+        ControlType::MenuItem,
+        ControlType::TabItem,
+        ControlType::CheckBox,
+        ControlType::RadioButton,
+        ControlType::ComboBox,
+        ControlType::ListItem,
+        ControlType::TreeItem,
+        ControlType::DataItem,
+        ControlType::Image,
+    ];
+    let mut control_type_conds: Vec<UICondition> = Vec::with_capacity(ct_ids.len());
+    for ct in ct_ids {
+        control_type_conds.push(prop(UIProperty::ControlType, Variant::from(ct as i32))?);
+    }
+    let by_control_type = or_all(automation, control_type_conds)?;
+
+    // Pattern-availability fallback: catches custom controls whose
+    // ControlType is structural (Pane / Group / Custom) but that still
+    // expose an action pattern. Stays in lock-step with
+    // `has_any_action_pattern`.
+    let pattern_conds = vec![
+        prop(UIProperty::IsInvokePatternAvailable, Variant::from(true))?,
+        prop(UIProperty::IsTogglePatternAvailable, Variant::from(true))?,
+        prop(
+            UIProperty::IsSelectionItemPatternAvailable,
+            Variant::from(true),
+        )?,
+        prop(
+            UIProperty::IsExpandCollapsePatternAvailable,
+            Variant::from(true),
+        )?,
+    ];
+    let by_pattern = or_all(automation, pattern_conds)?;
+
+    let interactable = automation.create_or_condition(by_control_type, by_pattern)?;
+
+    let is_control_element = prop(UIProperty::IsControlElement, Variant::from(true))?;
+
+    let offscreen = prop(UIProperty::IsOffscreen, Variant::from(true))?;
+    let on_screen = automation.create_not_condition(offscreen)?;
+
+    let with_control_element = automation.create_and_condition(is_control_element, interactable)?;
+    automation.create_and_condition(with_control_element, on_screen)
+}
+
+/// Read a cached boolean property as a `Result<bool>`. The `uiautomation`
+/// crate doesn't expose a direct `get_cached_is_*` for arbitrary boolean
+/// properties — only for a handful of named ones — so we go through the
+/// generic `get_cached_property_value` path and convert via `Variant`.
+/// Non-bool variants are surfaced as `Err`; callers fall back to the
+/// safe default themselves (usually "treat as enabled / on-screen" so a
+/// quirky control isn't dropped silently).
+fn cached_bool(el: &UIElement, prop: UIProperty) -> uiautomation::Result<bool> {
+    let v = el.get_cached_property_value(prop)?;
+    v.try_into()
+}
+
+/// Pack a Win32 HWND into the cache's opaque [`WindowKey`]. Round-trip
+/// is one-way (we never reconstruct an HWND from a key); we only need
+/// equality + hashing inside the map.
+fn hwnd_to_key(hwnd: HWND) -> WindowKey {
+    hwnd.0 as usize as u64
+}
+
+/// Monitor rect (in physical pixels) under the current cursor. Falls
+/// back to the entire virtual desktop when the cursor query or
+/// `GetMonitorInfo` fail — better to overshoot the scope than refuse
+/// to enumerate anything.
+fn current_monitor_rect() -> RECT {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt).is_err() {
+            return RECT {
+                left: i32::MIN / 2,
+                top: i32::MIN / 2,
+                right: i32::MAX / 2,
+                bottom: i32::MAX / 2,
+            };
+        }
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            mi.rcMonitor
+        } else {
+            RECT {
+                left: i32::MIN / 2,
+                top: i32::MIN / 2,
+                right: i32::MAX / 2,
+                bottom: i32::MAX / 2,
+            }
+        }
+    }
+}
+
+/// Fraction of the window's frame area that overlaps `monitor`, in
+/// [0.0, 1.0]. Phase 5 replaces the old "any pixel overlaps" check
+/// for `enumerate_active_monitor` so a window that's only just
+/// touching the active monitor (off-screen Slack, half-snapped Edge)
+/// is no longer worth a UIA walk. The all-windows scope mode skips
+/// this check entirely — it wants *every* visible HWND.
+fn rect_overlap_fraction(monitor: &RECT, bounds: &Bounds) -> f32 {
+    let area = (bounds.width as i64) * (bounds.height as i64);
+    if area <= 0 {
+        return 0.0;
+    }
+    let r_right = bounds.x + bounds.width;
+    let r_bottom = bounds.y + bounds.height;
+    let ix1 = bounds.x.max(monitor.left);
+    let iy1 = bounds.y.max(monitor.top);
+    let ix2 = r_right.min(monitor.right);
+    let iy2 = r_bottom.min(monitor.bottom);
+    let iw = (ix2 - ix1).max(0) as i64;
+    let ih = (iy2 - iy1).max(0) as i64;
+    let intersection = iw * ih;
+    intersection as f32 / area as f32
+}
+
+/// Multi-monitor z-order occlusion tracker.
+///
+/// `enumerate_visible` returns top-level windows in z-order top to
+/// bottom (highest first). For each candidate we ask: "is this window's
+/// frame already fully covered by one of the higher-z windows?" If so,
+/// the user can't see it, so walking it would only generate badges they
+/// can't act on.
+///
+/// We approximate occlusion by recording every accepted window's
+/// bounds and asking whether the candidate's frame intersects any
+/// **single** previously-recorded rectangle that fully covers it.
+/// True polygon-union coverage would require a sweep-line algorithm
+/// and a lot more code; full single-rect containment catches the
+/// dominant real-world case (a maximized window completely hiding the
+/// one beneath it on the same monitor) without the complexity.
+///
+/// Bounded to a small ring buffer so the check stays O(N) per
+/// candidate even with dozens of visible windows; in practice the
+/// "is fully covered" check exits on the first hit.
+struct OcclusionTracker {
+    higher_z: Vec<Bounds>,
+}
+
+impl OcclusionTracker {
+    fn new() -> Self {
+        Self {
+            higher_z: Vec::with_capacity(16),
+        }
+    }
+
+    /// True when `candidate` is fully contained in (and meaningfully
+    /// smaller than) any previously-recorded higher-z window. The size
+    /// guard prevents a window from accidentally occluding itself when
+    /// the same HWND appears twice — shouldn't happen in a clean
+    /// `EnumWindows` traversal but the guard is cheap insurance.
+    fn is_fully_covered(&self, candidate: &Bounds) -> bool {
+        if candidate.width <= 0 || candidate.height <= 0 {
+            return true; // nothing to walk anyway
+        }
+        for higher in &self.higher_z {
+            if bounds_contains(higher, candidate)
+                && (higher.width as i64 * higher.height as i64)
+                    > (candidate.width as i64 * candidate.height as i64)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record(&mut self, bounds: &Bounds) {
+        self.higher_z.push(*bounds);
+    }
+}
+
+fn bounds_contains(outer: &Bounds, inner: &Bounds) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && (inner.x + inner.width) <= (outer.x + outer.width)
+        && (inner.y + inner.height) <= (outer.y + outer.height)
+}
+
+/// Look up the owning process id of `hwnd`. Returns `0` if the call
+/// fails (typically because the HWND was destroyed between
+/// enumeration and pid lookup); callers treat `0` as a synthetic
+/// "unknown" group so those windows still get walked, just on their
+/// own worker.
+fn window_pid(hwnd: HWND) -> u32 {
+    let mut pid: u32 = 0;
+    // SAFETY: `GetWindowThreadProcessId` writes through `&mut pid`
+    // and tolerates a null hwnd (returns 0).
+    unsafe {
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+    }
+    pid
 }
 
 impl Backend for WindowsBackend {
     fn enumerate_foreground(&mut self) -> anyhow::Result<Vec<Element>> {
-        self.elements.clear();
-        self.next_id = 0;
-
         // SAFETY: `GetForegroundWindow` has no preconditions and may return a
         // null handle, which we check below.
         let hwnd = unsafe { GetForegroundWindow() };
@@ -177,59 +913,66 @@ impl Backend for WindowsBackend {
             return Ok(Vec::new());
         }
 
-        // Decide which detection path the upcoming walk will take. The
-        // browser path is more aggressive about size-filtering and pattern
-        // checks because the UIA tree mirrors the entire DOM; the desktop
-        // path is more permissive so custom controls aren't dropped.
-        self.is_current_browser = is_browser_window(hwnd);
-        tracing::debug!(
-            is_browser = self.is_current_browser,
-            "enumerate_foreground: detected window kind"
-        );
+        let is_browser = is_browser_window(hwnd);
+        tracing::debug!(is_browser, "enumerate_foreground: detected window kind");
 
-        // Chromium-based browsers (Chrome, Edge, Brave, …) defer building
-        // the renderer accessibility tree until an a11y client asks for
-        // it. By the time `element_from_handle` runs the browser process
-        // root is available, but the per-tab document/page tree may still
-        // be a single placeholder node. Send a `WM_GETOBJECT` to every
-        // descendant HWND first so the renderer is awake before we walk.
-        if self.is_current_browser {
-            activate_browser_accessibility(hwnd);
+        // Cache lookup before any UIA work. A hit means we were called
+        // again on the same HWND inside the TTL — either the
+        // "user pressed Esc, retrying" path or, with Phase 4 in
+        // place, the pre-warm worker beating the user to the walk
+        // after a foreground change. We only honor a hit when this
+        // backend already owns UIElement handles for every cached ID;
+        // otherwise [`Self::perform`] would fail with "unknown element
+        // id" when the user picks.
+        let key = hwnd_to_key(hwnd);
+        if let Some(cached) = self.cache.lock().get(key) {
+            let all_known = cached.iter().all(|e| self.elements.contains_key(&e.id));
+            if all_known {
+                tracing::debug!(
+                    cached = cached.len(),
+                    "enumerate_foreground served from cache"
+                );
+                return Ok(cached.as_ref().to_vec());
+            }
+            tracing::debug!(
+                cached = cached.len(),
+                "cache hit but IDs not registered locally; rewalking to bind UIElements"
+            );
         }
 
-        let handle = Handle::from(hwnd.0 as isize);
-        let root = self
-            .automation
-            .element_from_handle(handle)
-            .context("element_from_handle for foreground window failed")?;
-        let walker = self
-            .automation
-            .get_control_view_walker()
-            .context("creating control-view tree walker failed")?;
+        // Reset the local UIElement registry on a real miss; we hand
+        // out fresh IDs starting from zero so old badges from the
+        // previous walk can't be invoked by mistake.
+        self.elements.clear();
+        self.next_id = 0;
 
-        let mut out = Vec::with_capacity(64);
-        let mut stats = WalkStats::default();
-        self.walk(&walker, &root, 0, &mut out, &mut stats);
+        let records = walk_window(
+            &self.automation,
+            &self.cache_request,
+            &self.desktop_condition,
+            hwnd,
+            is_browser,
+        )?;
+        let out = self.register_records(records);
+
+        // Refresh the cache with the just-collected elements so the
+        // next call within `cache_ttl_ms` can short-circuit the walk
+        // entirely. The cache holds an `Arc<[Element]>` so subsequent
+        // cache hits are a single refcount bump even for a 2k-element
+        // browser walk.
+        let shared: Arc<[Element]> = Arc::from(out.clone().into_boxed_slice());
+        self.cache.lock().insert(key, shared);
 
         // Per-role breakdown helps when a user reports "keyhop didn't see
         // button X in app Y" — the log shows whether the element was
         // dropped by the role filter or never made it through the bounds
-        // / pattern checks at all. Walk stats tell us whether we ran out
-        // of room (depth/element cap) or genuinely exhausted the tree.
+        // / pattern checks at all.
         if tracing::enabled!(tracing::Level::DEBUG) {
             let mut by_role: HashMap<Role, usize> = HashMap::new();
             for el in &out {
                 *by_role.entry(el.role).or_insert(0) += 1;
             }
-            tracing::debug!(
-                collected = out.len(),
-                visited = stats.visited,
-                max_depth = stats.max_depth,
-                hit_depth_cap = stats.hit_depth_cap,
-                hit_element_cap = stats.hit_element_cap,
-                ?by_role,
-                "enumerate_foreground done"
-            );
+            tracing::debug!(collected = out.len(), ?by_role, "enumerate_foreground done");
         }
 
         Ok(out)
@@ -386,225 +1129,451 @@ fn pixel_delta_to_amount(delta: i32) -> ScrollAmount {
     }
 }
 
-impl WindowsBackend {
-    fn walk(
-        &mut self,
-        walker: &UITreeWalker,
-        el: &UIElement,
-        depth: usize,
-        out: &mut Vec<Element>,
-        stats: &mut WalkStats,
+/// Phase-5 free walker. Walks one HWND with the supplied UIA client
+/// state and returns the captured [`WalkRecord`]s. Stateless w.r.t.
+/// `WindowsBackend` so this can run on a rayon worker that owns its
+/// own `UIAutomation` (each thread is MTA-initialized when its
+/// `UIAutomation` is constructed). The caller assigns `ElementId`s
+/// and registers `UIElement`s in the backend after merging.
+pub(crate) fn walk_window(
+    automation: &UIAutomation,
+    cache_request: &UICacheRequest,
+    desktop_condition: &uiautomation::core::UICondition,
+    hwnd: HWND,
+    is_browser: bool,
+) -> anyhow::Result<Vec<WalkRecord>> {
+    if is_browser {
+        activate_browser_accessibility(hwnd);
+    }
+    let handle = Handle::from(hwnd.0 as isize);
+    let root = automation
+        .element_from_handle_build_cache(handle, cache_request)
+        .context("element_from_handle_build_cache failed")?;
+
+    let mut out = Vec::with_capacity(64);
+    let mut stats = WalkStats::default();
+    if is_browser {
+        let walker = automation
+            .get_control_view_walker()
+            .context("creating control-view tree walker failed")?;
+        walk_recurse(&walker, cache_request, &root, 0, true, &mut out, &mut stats);
+    } else {
+        find_all_desktop(
+            automation,
+            cache_request,
+            desktop_condition,
+            &root,
+            &mut out,
+            &mut stats,
+        );
+    }
+    // Post-walk dedup: collapse nested clickables so the overlay only
+    // surfaces the most-specific target per visual region. UIA loves to
+    // expose both an outer ListItem/Group and the inner Button/Hyperlink
+    // it wraps; without this pass the user sees stacked badges fighting
+    // for the same screen real estate.
+    let pre_dedup = out.len();
+    let out = dedup_nested_records(out);
+    let post_dedup = out.len();
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            collected = post_dedup,
+            dedup_dropped = pre_dedup - post_dedup,
+            visited = stats.visited,
+            max_depth = stats.max_depth,
+            hit_depth_cap = stats.hit_depth_cap,
+            hit_element_cap = stats.hit_element_cap,
+            ?hwnd,
+            is_browser,
+            "walk_window done"
+        );
+    }
+    Ok(out)
+}
+
+/// Recursive control-view walker. Used for browser windows where
+/// `FindAll(Subtree, …)` would over-match on DOM nodes.
+fn walk_recurse(
+    walker: &UITreeWalker,
+    cache_request: &UICacheRequest,
+    el: &UIElement,
+    depth: usize,
+    is_browser: bool,
+    out: &mut Vec<WalkRecord>,
+    stats: &mut WalkStats,
+) {
+    stats.visited += 1;
+    if depth > stats.max_depth {
+        stats.max_depth = depth;
+    }
+    let (max_elements, max_depth) = if is_browser {
+        (MAX_ELEMENTS_BROWSER, MAX_TREE_DEPTH_BROWSER)
+    } else {
+        (MAX_ELEMENTS_DESKTOP, MAX_TREE_DEPTH_DESKTOP)
+    };
+    if out.len() >= max_elements {
+        stats.hit_element_cap = true;
+        return;
+    }
+    if let Some(record) = try_record(el, is_browser) {
+        out.push(record);
+    }
+    if depth >= max_depth {
+        stats.hit_depth_cap = true;
+        return;
+    }
+    // `*_build_cache` walker variants prefetch the configured
+    // properties/patterns on the returned child/sibling in the same
+    // IPC that produces the new node. Without this, every
+    // `get_cached_*` inside `try_record` would fail because the new
+    // element wasn't in the cache scope of the original
+    // `element_from_handle_build_cache` call (cache scope is
+    // per-element, not transitive across walker hops).
+    if let Ok(first) = walker.get_first_child_build_cache(el, cache_request) {
+        let mut current = first;
+        loop {
+            walk_recurse(
+                walker,
+                cache_request,
+                &current,
+                depth + 1,
+                is_browser,
+                out,
+                stats,
+            );
+            match walker.get_next_sibling_build_cache(&current, cache_request) {
+                Ok(next) => current = next,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Phase-2 desktop walker: hand the whole subtree filter to UIA via
+/// `find_all_build_cache(TreeScope::Subtree, …)` and let the target
+/// process do the filtering on its own UI thread.
+fn find_all_desktop(
+    automation: &UIAutomation,
+    cache_request: &UICacheRequest,
+    desktop_condition: &uiautomation::core::UICondition,
+    root: &UIElement,
+    out: &mut Vec<WalkRecord>,
+    stats: &mut WalkStats,
+) {
+    match root.find_all_build_cache(
+        uiautomation::types::TreeScope::Subtree,
+        desktop_condition,
+        cache_request,
     ) {
-        stats.visited += 1;
-        if depth > stats.max_depth {
-            stats.max_depth = depth;
-        }
-        let (max_elements, max_depth) = if self.is_current_browser {
-            (MAX_ELEMENTS_BROWSER, MAX_TREE_DEPTH_BROWSER)
-        } else {
-            (MAX_ELEMENTS_DESKTOP, MAX_TREE_DEPTH_DESKTOP)
-        };
-        if out.len() >= max_elements {
-            stats.hit_element_cap = true;
-            return;
-        }
-        if let Some(record) = self.try_record(el) {
-            out.push(record);
-        }
-        if depth >= max_depth {
-            stats.hit_depth_cap = true;
-            return;
-        }
-        if let Ok(first) = walker.get_first_child(el) {
-            let mut current = first;
-            loop {
-                self.walk(walker, &current, depth + 1, out, stats);
-                match walker.get_next_sibling(&current) {
-                    Ok(next) => current = next,
-                    Err(_) => break,
+        Ok(elements) => {
+            stats.visited = elements.len();
+            for el in elements.iter() {
+                if out.len() >= MAX_ELEMENTS_DESKTOP {
+                    stats.hit_element_cap = true;
+                    break;
+                }
+                if let Some(record) = try_record_desktop_after_filter(el) {
+                    out.push(record);
                 }
             }
         }
-    }
-
-    /// Decide whether to record `el`, branching on whether the foreground
-    /// window is a browser. Returns `Some` for elements the user should be
-    /// able to hint, `None` otherwise.
-    fn try_record(&mut self, el: &UIElement) -> Option<Element> {
-        // Common preconditions: invisible / zero-sized / disabled elements
-        // are never useful to hint, regardless of which path runs.
-        if el.is_offscreen().unwrap_or(true) {
-            return None;
-        }
-        let bounds = el.get_bounding_rectangle().ok()?;
-        if bounds.get_width() <= 0 || bounds.get_height() <= 0 {
-            return None;
-        }
-        // `is_enabled` is best-effort: some controls don't implement the
-        // property and return Err. Treat those as enabled — better to
-        // include a stale-state badge than silently drop a valid target.
-        if !el.is_enabled().unwrap_or(true) {
-            return None;
-        }
-
-        let ct = el.get_control_type().ok()?;
-        if self.is_current_browser {
-            self.try_record_web_element(el, ct)
-        } else {
-            self.try_record_desktop_element(el, ct)
-        }
-    }
-
-    /// Desktop-app detection. Matches the legacy v0.2.0 behaviour for
-    /// known-interactable ControlTypes, then falls back to a pattern
-    /// check so custom controls (Pane/Group with InvokePattern, common
-    /// in modern Win32 / WinUI / Electron apps) get picked up too.
-    fn try_record_desktop_element(&mut self, el: &UIElement, ct: ControlType) -> Option<Element> {
-        if let Some(role) = map_role(ct) {
-            return self.create_element(el, role);
-        }
-        // Pattern fallback: anything that exposes an action pattern is
-        // worth showing, even if its ControlType is "structural". We
-        // gate on a small minimum size so we don't spam badges over
-        // every 1-pixel separator that happens to expose Toggle.
-        if has_any_action_pattern(el) {
-            let bounds = el.get_bounding_rectangle().ok()?;
-            if bounds.get_width() >= 10 && bounds.get_height() >= 10 {
-                return self.create_element(el, Role::Other);
+        Err(e) => {
+            // `FindAll` over a busy subtree can time out, or fail
+            // when an Electron renderer reattaches its accessibility
+            // tree mid-walk. Falling back keeps the picker functional.
+            tracing::warn!(error = ?e,
+                "find_all_build_cache failed on desktop subtree; falling back to recursive walk");
+            if let Ok(walker) = automation.get_control_view_walker() {
+                walk_recurse(&walker, cache_request, root, 0, false, out, stats);
             }
         }
-        None
     }
+}
 
-    /// Web-page / browser-content detection. Stricter than the desktop
-    /// path because the UIA tree mirrors the entire DOM and includes
-    /// piles of layout containers and decorative nodes.
-    ///
-    /// Detection cascade:
-    ///
-    /// 1. **High-confidence ControlTypes** (`Button`, `Hyperlink`,
-    ///    `Edit`, …) win immediately — these are unambiguous.
-    /// 2. **Structural types** (`Pane`, `Group`, `Image`, `Custom`,
-    ///    `Text`, `Document`) are only kept when they *also* expose an
-    ///    action pattern, an ARIA-mapped MSAA role, or
-    ///    `IsKeyboardFocusable=true`. This is the path that catches
-    ///    `<div role="button">`, `<a>` tags Chromium classifies as
-    ///    `Custom`, and click-handler-only divs that are still
-    ///    keyboard-tabbable (the modern accessibility floor).
-    /// 3. **Anything else** — last-chance ARIA / focus heuristic so
-    ///    the picker doesn't drop a target just because Chromium
-    ///    picked an exotic ControlType for it.
-    ///
-    /// Size filtering is split: known-interactive elements only need
-    /// to clear [`MIN_WEB_FOCUSABLE_SIZE`] (10px), so we still pick up
-    /// small icon buttons and chip "×" controls. Everything else has to
-    /// clear the stricter [`MIN_WEB_ELEMENT_SIZE`] (16px) — that's
-    /// where the spacer-element noise lives.
-    fn try_record_web_element(&mut self, el: &UIElement, ct: ControlType) -> Option<Element> {
-        use ControlType::*;
+/// Smallest dimension a hint can usefully label. Anything thinner than this
+/// can't fit even a single-letter badge without overflowing the target,
+/// and is almost always either a decorative pixel-strip (separator, focus
+/// rectangle) or a UIA noise node Windows leaves behind. Dropping these up
+/// front is the single biggest win for "screen full of badges" complaints.
+const MIN_HINT_PX: i32 = 12;
 
-        let bounds = el.get_bounding_rectangle().ok()?;
-        let w = bounds.get_width();
-        let h = bounds.get_height();
-        // Hard floor: anything smaller than `MIN_WEB_FOCUSABLE_SIZE` is
-        // almost certainly noise even for "interactive" elements. This
-        // catches accessibility nodes Chromium materialises with a
-        // 1×1 / 4×4 hit-box for offscreen content.
-        if w < MIN_WEB_FOCUSABLE_SIZE || h < MIN_WEB_FOCUSABLE_SIZE {
+/// Largest dimension a hint can plausibly belong to before it stops being
+/// a discrete click target. Real buttons / links / inputs cap out around
+/// ~1000px in practice; anything bigger is almost certainly a panel,
+/// document body, or layout container that exposes an action pattern by
+/// accident (e.g. an Edit covering the entire chat pane). The cap is
+/// generous on purpose so 4K monitors aren't punished for genuinely big
+/// affordances like full-width hero buttons.
+const MAX_HINT_PX: i32 = 1500;
+
+/// ControlTypes that masquerade as click targets in the UIA tree but are
+/// usually inert containers unless they're explicitly named, focusable,
+/// or expose an action pattern. Without this guard, `FindAll(Subtree, …)`
+/// pulls in every unnamed ListItem in a virtualized list and every <img>
+/// in a Chromium-based app, which is the dominant source of badge spam.
+fn is_structural_clickable_type(ct: ControlType) -> bool {
+    matches!(
+        ct,
+        ControlType::ListItem | ControlType::DataItem | ControlType::TreeItem | ControlType::Image
+    )
+}
+
+/// Slim variant of [`try_record`] used after the server-side pre-filter
+/// has already discarded offscreen / non-control elements. Adds the
+/// post-Phase-7 UX guards that the broad `FindAll(Subtree, …)` condition
+/// can't express server-side: minimum/maximum bounds, and a stricter
+/// "must be obviously interactable" check for structural ControlTypes.
+fn try_record_desktop_after_filter(el: &UIElement) -> Option<WalkRecord> {
+    let bounds = el.get_cached_bounding_rectangle().ok()?;
+    let w = bounds.get_width();
+    let h = bounds.get_height();
+    if w < MIN_HINT_PX || h < MIN_HINT_PX {
+        return None;
+    }
+    if w > MAX_HINT_PX || h > MAX_HINT_PX {
+        return None;
+    }
+    if !cached_bool(el, UIProperty::IsEnabled).unwrap_or(true) {
+        return None;
+    }
+    let ct = el.get_cached_control_type().ok()?;
+    if is_structural_clickable_type(ct) {
+        let has_name = el
+            .get_cached_name()
+            .ok()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_pattern = has_any_action_pattern(el);
+        let focusable = cached_bool(el, UIProperty::IsKeyboardFocusable).unwrap_or(false);
+        if !(has_name || has_pattern || focusable) {
             return None;
         }
-        let big_enough_for_anything = w >= MIN_WEB_ELEMENT_SIZE && h >= MIN_WEB_ELEMENT_SIZE;
+    }
+    try_record_desktop_element(el, ct)
+}
 
-        // Phase 1: high-confidence ControlTypes always win — even at
-        // the smaller 10px size, since something the browser explicitly
-        // labelled as e.g. a Button is clearly clickable.
-        let role = match ct {
-            Button | SplitButton => Some(Role::Button),
-            Hyperlink => Some(Role::Link),
-            Edit => Some(Role::TextInput),
-            CheckBox => Some(Role::Checkbox),
-            RadioButton => Some(Role::Radio),
-            ComboBox => Some(Role::ComboBox),
-            MenuItem => Some(Role::MenuItem),
-            TabItem => Some(Role::Tab),
-            ListItem | TreeItem | DataItem => Some(Role::ListItem),
-
-            // Phase 2: ambiguous / structural types need *some* signal
-            // that they're interactive before we count them.
-            Image | Custom | Pane | Group | Text | Document => {
-                let interactive = has_any_action_pattern(el)
-                    || looks_clickable_web(el)
-                    || el.is_keyboard_focusable().unwrap_or(false);
-                if !interactive {
-                    None
-                } else if matches!(ct, Image) {
-                    Some(Role::Button)
-                } else {
-                    Some(Role::Other)
-                }
-            }
-            _ => None,
-        };
-
-        if let Some(role) = role {
-            // Big_enough_for_anything is only enforced for Phase 2 noise:
-            // a real `Button` ControlType clears the smaller floor by
-            // design, even if the browser sized it down.
-            let needs_big = matches!(ct, Image | Custom | Pane | Group | Text | Document);
-            if needs_big && !big_enough_for_anything {
-                return None;
-            }
-            return self.create_element(el, role);
+/// Drop records that are visually redundant with another record in the
+/// same window: when one record's bounds fully contain another and the
+/// outer is meaningfully larger, keep the inner (the more specific click
+/// target) and drop the outer (a container disguised as clickable).
+///
+/// The 3:2 area ratio guard keeps near-equal records from cannibalizing
+/// each other (e.g. a Button and its inner Text node sharing bounds) —
+/// in those cases the walker emits both and the layout collision logic
+/// hides the duplicate naturally.
+///
+/// Worst-case complexity is O(n²), but `n` is bounded by
+/// [`MAX_ELEMENTS_DESKTOP`]/[`MAX_ELEMENTS_BROWSER`] so the absolute cost
+/// stays well under a millisecond per window even on the busiest pages.
+fn dedup_nested_records(records: Vec<WalkRecord>) -> Vec<WalkRecord> {
+    let n = records.len();
+    if n <= 1 {
+        return records;
+    }
+    let areas: Vec<i64> = records
+        .iter()
+        .map(|r| (r.bounds.width as i64) * (r.bounds.height as i64))
+        .collect();
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        if !keep[i] {
+            continue;
         }
-
-        // Phase 3: last-chance heuristic for ControlTypes we didn't
-        // match above. Catches things like ARIA `role="button"` exposed
-        // only via the legacy IAccessible bridge, or pure-JS clickable
-        // elements that show up under exotic ControlTypes but are
-        // tabbable through keyboard navigation.
-        if big_enough_for_anything
-            && (looks_clickable_web(el) || el.is_keyboard_focusable().unwrap_or(false))
-        {
-            return self.create_element(el, Role::Button);
+        let outer = &records[i].bounds;
+        let outer_area = areas[i];
+        for j in 0..n {
+            if i == j || !keep[j] {
+                continue;
+            }
+            let inner = &records[j].bounds;
+            if !bounds_contains(outer, inner) {
+                continue;
+            }
+            // Outer must be at least 1.5× the inner's area before we
+            // call it "the container" — otherwise the two are essentially
+            // co-located and we leave dedup to the overlay layout pass.
+            if outer_area > areas[j].saturating_mul(3) / 2 {
+                keep[i] = false;
+                break;
+            }
         }
+    }
+    records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| if keep[i] { Some(r) } else { None })
+        .collect()
+}
 
-        None
+/// Decide whether to record `el`, branching on browser vs desktop.
+fn try_record(el: &UIElement, is_browser: bool) -> Option<WalkRecord> {
+    if cached_bool(el, UIProperty::IsOffscreen).unwrap_or(false) {
+        return None;
+    }
+    let bounds = el.get_cached_bounding_rectangle().ok()?;
+    if bounds.get_width() <= 0 || bounds.get_height() <= 0 {
+        return None;
+    }
+    if !cached_bool(el, UIProperty::IsEnabled).unwrap_or(true) {
+        return None;
+    }
+    let ct = el.get_cached_control_type().ok()?;
+    if is_browser {
+        try_record_web_element(el, ct)
+    } else {
+        try_record_desktop_element(el, ct)
+    }
+}
+
+/// Desktop-app detection. Matches v0.2.0 behaviour for known
+/// interactable ControlTypes, plus a pattern fallback for custom
+/// controls (Pane / Group / Custom that nonetheless expose an action
+/// pattern).
+fn try_record_desktop_element(el: &UIElement, ct: ControlType) -> Option<WalkRecord> {
+    if let Some(role) = map_role(ct) {
+        return create_walk_record(el, role);
+    }
+    if has_any_action_pattern(el) {
+        let bounds = el.get_cached_bounding_rectangle().ok()?;
+        if bounds.get_width() >= 10 && bounds.get_height() >= 10 {
+            return create_walk_record(el, Role::Other);
+        }
+    }
+    None
+}
+
+/// Web-page / browser-content detection. Stricter than the desktop
+/// path because the UIA tree mirrors the entire DOM and includes
+/// piles of layout containers and decorative nodes.
+///
+/// Detection cascade:
+///
+/// 1. **High-confidence ControlTypes** (`Button`, `Hyperlink`,
+///    `Edit`, …) win immediately — these are unambiguous.
+/// 2. **Structural types** (`Pane`, `Group`, `Image`, `Custom`,
+///    `Text`, `Document`) are only kept when they *also* expose an
+///    action pattern, an ARIA-mapped MSAA role, or
+///    `IsKeyboardFocusable=true`. This is the path that catches
+///    `<div role="button">`, `<a>` tags Chromium classifies as
+///    `Custom`, and click-handler-only divs that are still
+///    keyboard-tabbable (the modern accessibility floor).
+/// 3. **Anything else** — last-chance ARIA / focus heuristic so
+///    the picker doesn't drop a target just because Chromium
+///    picked an exotic ControlType for it.
+///
+/// Size filtering is split: known-interactive elements only need
+/// to clear [`MIN_WEB_FOCUSABLE_SIZE`] (10px), so we still pick up
+/// small icon buttons and chip "×" controls. Everything else has to
+/// clear the stricter [`MIN_WEB_ELEMENT_SIZE`] (16px) — that's
+/// where the spacer-element noise lives.
+fn try_record_web_element(el: &UIElement, ct: ControlType) -> Option<WalkRecord> {
+    use ControlType::*;
+
+    let bounds = el.get_cached_bounding_rectangle().ok()?;
+    let w = bounds.get_width();
+    let h = bounds.get_height();
+    // Hard floor: anything smaller than `MIN_WEB_FOCUSABLE_SIZE` is
+    // almost certainly noise even for "interactive" elements. This
+    // catches accessibility nodes Chromium materialises with a
+    // 1×1 / 4×4 hit-box for offscreen content.
+    if w < MIN_WEB_FOCUSABLE_SIZE || h < MIN_WEB_FOCUSABLE_SIZE {
+        return None;
+    }
+    let big_enough_for_anything = w >= MIN_WEB_ELEMENT_SIZE && h >= MIN_WEB_ELEMENT_SIZE;
+
+    // Phase 1: high-confidence ControlTypes always win — even at
+    // the smaller 10px size, since something the browser explicitly
+    // labelled as e.g. a Button is clearly clickable.
+    let role = match ct {
+        Button | SplitButton => Some(Role::Button),
+        Hyperlink => Some(Role::Link),
+        Edit => Some(Role::TextInput),
+        CheckBox => Some(Role::Checkbox),
+        RadioButton => Some(Role::Radio),
+        ComboBox => Some(Role::ComboBox),
+        MenuItem => Some(Role::MenuItem),
+        TabItem => Some(Role::Tab),
+        ListItem | TreeItem | DataItem => Some(Role::ListItem),
+
+        // Phase 2: ambiguous / structural types need *some* signal
+        // that they're interactive before we count them.
+        Image | Custom | Pane | Group | Text | Document => {
+            let interactive = has_any_action_pattern(el)
+                || looks_clickable_web(el)
+                || cached_bool(el, UIProperty::IsKeyboardFocusable).unwrap_or(false);
+            if !interactive {
+                None
+            } else if matches!(ct, Image) {
+                Some(Role::Button)
+            } else {
+                Some(Role::Other)
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(role) = role {
+        // Big_enough_for_anything is only enforced for Phase 2 noise:
+        // a real `Button` ControlType clears the smaller floor by
+        // design, even if the browser sized it down.
+        let needs_big = matches!(ct, Image | Custom | Pane | Group | Text | Document);
+        if needs_big && !big_enough_for_anything {
+            return None;
+        }
+        return create_walk_record(el, role);
     }
 
-    /// Build the public [`Element`] for a recorded UIA element, assign it
-    /// a stable ID, and register it for later [`Backend::perform`] lookups.
-    /// Centralising this means the desktop and web paths can't drift apart
-    /// on what an Element actually contains.
-    fn create_element(&mut self, el: &UIElement, role: Role) -> Option<Element> {
-        let bounds = el.get_bounding_rectangle().ok()?;
-        let name = el.get_name().ok().filter(|s| !s.is_empty());
-
-        let id = ElementId(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1);
-        self.elements.insert(id, el.clone());
-
-        Some(Element {
-            id,
-            role,
-            name,
-            bounds: Bounds {
-                x: bounds.get_left(),
-                y: bounds.get_top(),
-                width: bounds.get_width(),
-                height: bounds.get_height(),
-            },
-        })
+    // Phase 3: last-chance heuristic for ControlTypes we didn't
+    // match above. Catches things like ARIA `role="button"` exposed
+    // only via the legacy IAccessible bridge, or pure-JS clickable
+    // elements that show up under exotic ControlTypes but are
+    // tabbable through keyboard navigation.
+    if big_enough_for_anything
+        && (looks_clickable_web(el)
+            || cached_bool(el, UIProperty::IsKeyboardFocusable).unwrap_or(false))
+    {
+        return create_walk_record(el, Role::Button);
     }
+
+    None
+}
+
+/// Build a [`WalkRecord`] for a recorded UIA element. ID assignment
+/// and registration in [`WindowsBackend::elements`] happen later, on
+/// the merging thread; this function only does in-process reads
+/// (cached bounding rect + name) so it is safe to call from any
+/// MTA-initialized worker.
+fn create_walk_record(el: &UIElement, role: Role) -> Option<WalkRecord> {
+    let bounds = el.get_cached_bounding_rectangle().ok()?;
+    let name = el.get_cached_name().ok().filter(|s| !s.is_empty());
+    Some(WalkRecord {
+        role,
+        name,
+        bounds: Bounds {
+            x: bounds.get_left(),
+            y: bounds.get_top(),
+            width: bounds.get_width(),
+            height: bounds.get_height(),
+        },
+        element: el.clone(),
+    })
 }
 
 /// True when `el` advertises any of the patterns we know how to invoke.
 /// Used by the desktop pattern-fallback path to catch custom controls
 /// whose ControlType doesn't tell us they're interactable.
 fn has_any_action_pattern(el: &UIElement) -> bool {
-    el.get_pattern::<UIInvokePattern>().is_ok()
-        || el.get_pattern::<UITogglePattern>().is_ok()
-        || el.get_pattern::<UISelectionItemPattern>().is_ok()
-        || el.get_pattern::<UIExpandCollapsePattern>().is_ok()
+    // `get_cached_pattern` is the in-process counterpart of `get_pattern`:
+    // it succeeds iff the cache request enabled the pattern *and* the
+    // remote element actually advertised it. The four patterns here must
+    // stay in lock-step with the `add_pattern` calls in
+    // `build_cache_request` — otherwise this function silently returns
+    // `false` for everything and the desktop pattern-fallback path goes
+    // dark.
+    el.get_cached_pattern::<UIInvokePattern>().is_ok()
+        || el.get_cached_pattern::<UITogglePattern>().is_ok()
+        || el.get_cached_pattern::<UISelectionItemPattern>().is_ok()
+        || el.get_cached_pattern::<UIExpandCollapsePattern>().is_ok()
 }
 
 /// Heuristic for "this looks clickable even though no UIA pattern says so".
@@ -620,10 +1589,10 @@ fn has_any_action_pattern(el: &UIElement) -> bool {
 /// frequently show up only via the legacy bridge in modern web apps
 /// (Gmail's row toggles, GitHub's file tree, dashboard grids, …).
 fn looks_clickable_web(el: &UIElement) -> bool {
-    let Ok(p) = el.get_pattern::<UILegacyIAccessiblePattern>() else {
+    let Ok(p) = el.get_cached_pattern::<UILegacyIAccessiblePattern>() else {
         return false;
     };
-    let Ok(role) = p.get_role() else {
+    let Ok(role) = p.get_cached_role() else {
         return false;
     };
     matches!(

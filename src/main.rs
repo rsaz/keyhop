@@ -15,15 +15,19 @@
 
 use std::process::ExitCode;
 
+#[cfg(windows)]
+use keyhop::config::ScopeMode;
 use keyhop::{Action, Backend, Config, Element, HintEngine};
 
 #[cfg(windows)]
 use keyhop::windows::{
-    hotkey::{HotkeyAction, Hotkeys},
+    config_watcher::{self, WM_USER_RELOAD_CONFIG},
+    hotkey::{HotkeyAction, HotkeyConflict, Hotkeys},
     ipc, notification,
     overlay::{pick_hint, Hint, HintStyle},
     settings_window,
     single_instance::InstanceGuard,
+    splash_screen::SplashScreen,
     startup,
     tray::{Tray, TrayCommand},
     window_picker,
@@ -151,6 +155,7 @@ fn print_help() {
 
 #[cfg(windows)]
 fn run_windows(cli: Cli) -> anyhow::Result<()> {
+    use ::windows::Win32::System::Threading::GetCurrentThreadId;
     use ::windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
     };
@@ -168,6 +173,19 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         }
     };
 
+    // Show splash screen during initialization. Track when it appeared so
+    // we can enforce a minimum display time below — on fast machines the
+    // rest of init finishes in <100ms and the splash would otherwise
+    // flash by too quickly for the user to register.
+    let splash_shown_at = std::time::Instant::now();
+    let splash = match SplashScreen::show() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to show splash screen; continuing anyway");
+            None
+        }
+    };
+
     // Hidden IPC window so a future `keyhop --close` can find this
     // process and ask it to shut down. Held alive until the message
     // loop exits; dropping it destroys the window.
@@ -179,34 +197,63 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
         }
     };
 
-    let config = Config::load_or_default();
-    let hint_engine = HintEngine::new(&config.hints.alphabet);
+    let mut config = Config::load_or_default();
+    // Resolve the alphabet from the preset + flags every launch so users
+    // who hand-edit `[hints]` to switch presets don't have to delete the
+    // stale `alphabet` field by hand. Settings dialog Save also writes
+    // a resolved value, so this is just defence-in-depth.
+    let resolved_alphabet = keyhop::alphabet_presets::build_alphabet(&config.hints);
+    let hint_engine = keyhop::HintEngine::with_strategy(&resolved_alphabet, config.hints.strategy)
+        .with_min_singles(config.hints.min_singles);
     let element_style = HintStyle::elements_from_config(&config.colors.element);
     let window_style = HintStyle::windows_from_config(&config.colors.window);
 
-    let mut backend = keyhop::windows::WindowsBackend::new()?;
+    let mut backend = keyhop::windows::WindowsBackend::with_config(
+        config.performance.enable_caching,
+        config.performance.cache_ttl_ms,
+        config.scope.max_elements,
+    )?;
+
+    // Phase 4: spin up the foreground-tracking pre-warm worker so the
+    // hotkey path can serve from a hot cache. Held in a binding whose
+    // `Drop` unhooks `SetWinEventHook` on shutdown. Failure is
+    // non-fatal: the synchronous hotkey path still works, just with
+    // cold-cache UIA latency on each press.
+    let _prewarm = match keyhop::windows::prewarm::Prewarmer::start(
+        backend.cache_handle(),
+        config.scope.max_elements,
+    ) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = ?e, "prewarm worker unavailable; hotkeys will run cold");
+            None
+        }
+    };
 
     // Register hotkeys from config. Conflicts (e.g. another app already
     // owns the chord) are surfaced to the user but don't abort startup —
     // partial registration is better than nothing, and the user can fix
     // the broken chord in Settings.
     let outcome = Hotkeys::register_from_config(&config.hotkeys)?;
-    let hotkeys = outcome.hotkeys;
+    let mut hotkeys = outcome.hotkeys;
     if !outcome.conflicts.is_empty() {
-        let body = outcome
-            .conflicts
-            .iter()
-            .map(|c| format!("• {} ({}): {}", c.action, c.chord, c.reason))
-            .collect::<Vec<_>>()
-            .join("\n");
-        notification::warn(
-            "keyhop: hotkey conflict",
-            &format!(
-                "Some hotkeys couldn't be registered:\n\n{body}\n\n\
-                Open Settings from the tray to choose a different chord."
-            ),
-        );
+        notify_hotkey_conflicts(&outcome.conflicts);
     }
+
+    // Hot-reload watcher. Best-effort: failure leaves keyhop fully
+    // functional but missing the live-edit-`config.toml` convenience.
+    // Held in a binding so its `Drop` only fires when `run_windows`
+    // returns. The Settings dialog also triggers reload (without
+    // depending on the watcher), so users on locked-down profiles
+    // where filesystem watching fails still get hot-reload via Save.
+    let main_thread_id = unsafe { GetCurrentThreadId() };
+    let _config_watcher = match config_watcher::spawn(main_thread_id) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = ?e, "config hot-reload watcher unavailable");
+            None
+        }
+    };
 
     // The tray is opt-in via `--no-tray` and best-effort otherwise: if it
     // can't be created (e.g. headless CI, no Explorer shell) we still want
@@ -227,6 +274,7 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     println!("keyhop {} is running.", env!("CARGO_PKG_VERSION"));
     println!("  Pick element : {}", config.hotkeys.pick_element);
     println!("  Pick window  : {}", config.hotkeys.pick_window);
+    println!("  Open settings: {}", config.hotkeys.open_settings);
     println!("  Cancel       : Esc (inside overlay)");
     #[cfg(debug_assertions)]
     {
@@ -249,10 +297,39 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
     println!();
     println!("Switch focus to any app, then press a leader.");
 
-    let runtime = Runtime {
+    // Keep the splash visible for at least 2.5s so the user actually sees
+    // the brand mark on fast machines where init completes in <100ms.
+    // Pump messages while we wait so the splash stays painted.
+    if splash.is_some() {
+        const MIN_SPLASH_MS: u128 = 2500;
+        let elapsed = splash_shown_at.elapsed().as_millis();
+        if elapsed < MIN_SPLASH_MS {
+            let remaining = MIN_SPLASH_MS - elapsed;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(remaining as u64);
+            use ::windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW as DM, PeekMessageW as PM, TranslateMessage as TM, MSG as M,
+                PM_REMOVE as PMR,
+            };
+            let mut m = M::default();
+            while std::time::Instant::now() < deadline {
+                unsafe {
+                    while PM(&mut m, None, 0, 0, PMR).as_bool() {
+                        let _ = TM(&m);
+                        DM(&m);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        }
+    }
+    drop(splash);
+
+    let mut runtime = Runtime {
         hint_engine,
         element_style,
         window_style,
+        scope_mode: config.scope.mode,
     };
 
     // Win32 message loop. `GetMessageW` is required on this thread for the
@@ -265,18 +342,60 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
             // 0 = WM_QUIT (clean shutdown via PostQuitMessage), -1 = error.
             break;
         }
+
+        // Custom thread message from the config-file watcher: re-read
+        // the file from disk and hot-apply. Skip Translate/Dispatch
+        // for thread messages — they have a NULL hwnd, so DispatchMessage
+        // would route them through DefWindowProc and waste cycles.
+        if msg.hwnd.0.is_null() && msg.message == WM_USER_RELOAD_CONFIG {
+            tracing::info!("config-file change detected, reloading");
+            let new_config = Config::load_or_default();
+            if new_config != config {
+                apply_config(
+                    &new_config,
+                    &mut config,
+                    &mut runtime,
+                    &mut backend,
+                    &mut hotkeys,
+                    /* announce = */ true,
+                );
+            }
+            continue;
+        }
+
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
         for action in hotkeys.poll_actions() {
-            if let Err(e) = dispatch_hotkey(action, &mut backend, &runtime) {
-                tracing::error!(?action, error = ?e, "hotkey handler failed");
-                notification::error(
-                    "keyhop: action failed",
-                    &format!("{action:?} failed:\n{e}\n\nSee log for details."),
-                );
+            match action {
+                HotkeyAction::OpenSettings => match settings_window::show(&config) {
+                    Ok(Some(new_config)) => {
+                        apply_config(
+                            &new_config,
+                            &mut config,
+                            &mut runtime,
+                            &mut backend,
+                            &mut hotkeys,
+                            /* announce = */ true,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(error = ?e, "settings window failed");
+                        notification::error("Couldn't open Settings", &format!("{e}"));
+                    }
+                },
+                _ => {
+                    if let Err(e) = dispatch_hotkey(action, &mut backend, &runtime) {
+                        tracing::error!(?action, error = ?e, "hotkey handler failed");
+                        notification::error(
+                            "keyhop: action failed",
+                            &format!("{action:?} failed:\n{e}\n\nSee log for details."),
+                        );
+                    }
+                }
             }
         }
 
@@ -302,31 +421,41 @@ fn run_windows(cli: Cli) -> anyhow::Result<()> {
                         }
                     }
                     TrayCommand::OpenSettings => match settings_window::show(&config) {
-                        Ok(true) => {
-                            // Apply the new startup state immediately even
-                            // though everything else needs a restart, since
-                            // it has nothing to do with the message loop.
-                            let _ = startup::is_enabled();
-                            notification::info(
-                                "Settings saved",
-                                "Restart keyhop to apply hotkey, alphabet, and color changes.",
+                        Ok(Some(new_config)) => {
+                            apply_config(
+                                &new_config,
+                                &mut config,
+                                &mut runtime,
+                                &mut backend,
+                                &mut hotkeys,
+                                /* announce = */ true,
                             );
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(e) => {
                             tracing::error!(error = ?e, "settings window failed");
                             notification::error("Couldn't open Settings", &format!("{e}"));
                         }
                     },
-                    #[cfg(not(debug_assertions))]
                     TrayCommand::ViewLog => {
-                        if let Err(e) = open_log_file() {
-                            tracing::error!(error = ?e, "failed to open log file");
+                        #[cfg(not(debug_assertions))]
+                        {
+                            if let Err(e) = open_log_file() {
+                                tracing::error!(error = ?e, "failed to open log file");
+                                notification::error("keyhop: couldn't open log", &format!("{e}"));
+                            }
                         }
-                    }
-                    #[cfg(debug_assertions)]
-                    TrayCommand::ViewLog => {
-                        // ViewLog shouldn't be available in debug builds, but handle it gracefully
+                        #[cfg(debug_assertions)]
+                        {
+                            // Debug builds write to stderr, so there's no
+                            // log file to open. Surface that to the user
+                            // rather than silently doing nothing.
+                            notification::info(
+                                "View Log unavailable",
+                                "Debug builds write logs to stderr, not to a file. \
+                                Run the release build to use this option.",
+                            );
+                        }
                     }
                     TrayCommand::Quit => {
                         tracing::info!("quit requested from tray");
@@ -349,6 +478,122 @@ struct Runtime {
     hint_engine: HintEngine,
     element_style: HintStyle,
     window_style: HintStyle,
+    /// Which set of windows the element picker enumerates. Driven by
+    /// `[scope]` in `config.toml`; defaults to active-window for
+    /// backwards-compatible v0.3.0 behaviour.
+    scope_mode: ScopeMode,
+}
+
+/// Hot-apply a freshly loaded [`Config`] to every live subsystem
+/// without restarting the process. Called from both the Settings
+/// dialog Save handler and the [`config_watcher`]'s file-change
+/// thread message; both code paths converge here so the apply logic
+/// stays in one place.
+///
+/// Steps, in dependency order:
+///   1. Resolve the alphabet from the preset+modifiers and rebuild
+///      the [`HintEngine`].
+///   2. Rebuild the element / window [`HintStyle`]s (colors, opacity,
+///      leader pref).
+///   3. Push the new scope mode into [`Runtime`].
+///   4. Push cache + max-elements into the [`WindowsBackend`] without
+///      reconstructing it (the UIA client is expensive to recreate).
+///   5. Tear down the old [`Hotkeys`] *before* registering the new
+///      ones — the OS hotkey table is per-process so re-registering
+///      the same chord on top of itself would otherwise fail.
+///   6. Update the registry "launch at startup" entry to match.
+///   7. Replace the cached `Config` so subsequent Settings opens see
+///      the current state, not the stale one we loaded at startup.
+///
+/// `announce` controls whether a "Settings applied" toast fires;
+/// pass `false` for silent reloads (e.g. on first paint).
+#[cfg(windows)]
+fn apply_config(
+    new_config: &Config,
+    cached: &mut Config,
+    runtime: &mut Runtime,
+    backend: &mut keyhop::windows::WindowsBackend,
+    hotkeys: &mut Hotkeys,
+    announce: bool,
+) {
+    let resolved_alphabet = keyhop::alphabet_presets::build_alphabet(&new_config.hints);
+    runtime.hint_engine =
+        keyhop::HintEngine::with_strategy(&resolved_alphabet, new_config.hints.strategy)
+            .with_min_singles(new_config.hints.min_singles);
+    runtime.element_style = HintStyle::elements_from_config(&new_config.colors.element);
+    runtime.window_style = HintStyle::windows_from_config(&new_config.colors.window);
+    runtime.scope_mode = new_config.scope.mode;
+
+    backend.reconfigure_cache(
+        new_config.performance.enable_caching,
+        new_config.performance.cache_ttl_ms,
+    );
+    backend.set_max_elements_global(new_config.scope.max_elements);
+
+    // Drop the old Hotkeys *before* trying to register the new ones.
+    // Windows' RegisterHotKey is per-process, so replacing
+    // Ctrl+Shift+Space (old) with Ctrl+Shift+Space (new) would fail
+    // on the `register` call if the old chord was still alive at the
+    // moment of attempt. The empty-Hotkeys placeholder either built
+    // here or already in `*hotkeys` keeps the type intact between
+    // the drop and the new assignment.
+    if let Ok(empty) = Hotkeys::new() {
+        let _drop_old = std::mem::replace(hotkeys, empty);
+        // _drop_old goes out of scope at the end of this `if let`,
+        // releasing every chord it was holding.
+    }
+    match Hotkeys::register_from_config(&new_config.hotkeys) {
+        Ok(outcome) => {
+            *hotkeys = outcome.hotkeys;
+            if !outcome.conflicts.is_empty() {
+                notify_hotkey_conflicts(&outcome.conflicts);
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "re-registering hotkeys after reload failed");
+            notification::error(
+                "keyhop: hotkey reload failed",
+                &format!(
+                    "{e}\n\nThe previous chords are no longer active. Open Settings to retry."
+                ),
+            );
+        }
+    }
+
+    // Best-effort: a registry write failure here is non-fatal;
+    // everything else has already taken effect in-process.
+    if let Err(e) = startup::set_enabled(new_config.startup.launch_at_startup) {
+        tracing::warn!(error = ?e, "couldn't sync launch-at-startup registry entry");
+    }
+
+    *cached = new_config.clone();
+
+    if announce {
+        notification::info(
+            "Settings applied",
+            "Your changes are live now — no restart needed.",
+        );
+    }
+}
+
+/// Common path for "we just registered hotkeys and one or more
+/// failed". Surfacing through a notification rather than the log
+/// matters because the failure is otherwise silent — the user just
+/// sees their chord doing nothing.
+#[cfg(windows)]
+fn notify_hotkey_conflicts(conflicts: &[HotkeyConflict]) {
+    let body = conflicts
+        .iter()
+        .map(|c| format!("• {} ({}): {}", c.action, c.chord, c.reason))
+        .collect::<Vec<_>>()
+        .join("\n");
+    notification::warn(
+        "keyhop: hotkey conflict",
+        &format!(
+            "Some hotkeys couldn't be registered:\n\n{body}\n\n\
+            Open Settings to choose a different chord."
+        ),
+    );
 }
 
 #[cfg(windows)]
@@ -360,6 +605,7 @@ fn dispatch_hotkey(
     match action {
         HotkeyAction::PickElement => handle_pick_element(backend, runtime),
         HotkeyAction::PickWindow => handle_pick_window(runtime),
+        HotkeyAction::OpenSettings => Ok(()), // Handled separately in main loop
     }
 }
 
@@ -368,7 +614,7 @@ fn handle_pick_element(
     backend: &mut keyhop::windows::WindowsBackend,
     runtime: &Runtime,
 ) -> anyhow::Result<()> {
-    let elements: Vec<Element> = backend.enumerate_foreground()?;
+    let elements: Vec<Element> = backend.enumerate_by_scope(runtime.scope_mode)?;
     if elements.is_empty() {
         tracing::info!("no interactable elements in foreground window");
         notification::info(
