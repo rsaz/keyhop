@@ -66,7 +66,7 @@ tray-icon = { version = "0.22", default-features = false }
 # code is `cfg(windows)`-gated) but `notify` itself is portable.
 notify = "6"
 # PNG image decoding for splash screen and tray icon.
-png = "0.17"
+png = "0.18"
 
 [profile.release]
 lto = "thin"
