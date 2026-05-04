@@ -57,7 +57,7 @@ uiautomation = "0.24"
 # remote app processes; rayon lets us overlap those waits across
 # pid-groups without oversubscribing any one app's UI thread.
 rayon = "1"
-global-hotkey = "0.7"
+global-hotkey = "0.8"
 # default-features off skips the X11 (`libxdo`) backend muda would pull in
 # otherwise — pure dead weight on Windows.
 tray-icon = { version = "0.22", default-features = false }
